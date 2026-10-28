@@ -407,11 +407,14 @@ class SurvivorDhanClient:
             return ip_info
 
     def place_order_with_ip_retry(self, **order_kwargs) -> dict:
-        """Place an order; if DH-905 Invalid IP hits, auto-heal IP + regenerate token and retry once."""
+        """Place an order; if DH-905 Invalid IP hits, auto-heal IP + regenerate token and retry once.
+        Exit-protection paths (verified flatten, protective SL) pass auto_heal_ip=False:
+        an emergency exit must NEVER trigger IP-whitelist mutation."""
+        auto_heal = order_kwargs.pop("auto_heal_ip", True)
         res = self.dhan.place_order(**order_kwargs)
         if res.get("status") != "success":
             err_code = (res.get("remarks") or {}).get("error_code") if isinstance(res.get("remarks"), dict) else ""
-            if err_code == "DH-905":
+            if err_code == "DH-905" and auto_heal:
                 logger.warning("DH-905 Invalid IP — running ensure_ip_whitelisted() + token renewal and retrying...")
                 self.ensure_ip_whitelisted()
                 res = self.dhan.place_order(**order_kwargs)
@@ -695,7 +698,7 @@ class SurvivorDhanClient:
                 d = st.get("data") if isinstance(st, dict) else None
                 if isinstance(d, list) and d:
                     d = d[0]
-                s = (d or {}).get("orderStatus")
+                s = (d if isinstance(d, dict) else {}).get("orderStatus")
                 if s in ("TRADED", "REJECTED", "CANCELLED"):
                     return s
             except Exception:
@@ -712,9 +715,9 @@ class SurvivorDhanClient:
         actions = []
         try:
             orders_resp = self.dhan.get_order_list()
-            orders = orders_resp.get("data", []) if isinstance(orders_resp, dict) else []
-            for o in orders:
-                if o.get("orderStatus") in ("PENDING", "TRANSIT"):
+            _orders = orders_resp.get("data") if isinstance(orders_resp, dict) else None
+            for o in (_orders or []):
+                if isinstance(o, dict) and o.get("orderStatus") in ("PENDING", "TRANSIT"):
                     oid = o.get("orderId")
                     if oid:
                         self.dhan.cancel_order(oid)
@@ -739,6 +742,7 @@ class SurvivorDhanClient:
             filled = False
             for attempt in range(max_retries):
                 res = self.place_order_with_ip_retry(
+                    auto_heal_ip=False,   # emergency exits must never mutate the IP whitelist
                     security_id=sec_id,
                     exchange_segment=exch,
                     transaction_type=txn,
@@ -801,6 +805,7 @@ class SurvivorDhanClient:
                 lim_px = round(round((trig * 1.02) / tick) * tick, 2)
 
             res = self.place_order_with_ip_retry(
+                auto_heal_ip=False,   # protective SL exits must never mutate the IP whitelist
                 security_id=str(security_id),
                 exchange_segment=exchange_segment,
                 transaction_type=transaction_type,
@@ -1445,7 +1450,7 @@ def _abort_unfilled_entry(client: "SurvivorDhanClient", trade_record: Dict) -> N
             d = st.get("data") if isinstance(st, dict) else None
             if isinstance(d, list) and d:
                 d = d[0]
-            status = (d or {}).get("orderStatus", "")
+            status = (d if isinstance(d, dict) else {}).get("orderStatus", "")
             if status in ("PENDING", "TRANSIT"):
                 client.dhan.cancel_order(oid)
                 print(f"↩️ Entry never filled; cancelled pending entry order {oid}.")
