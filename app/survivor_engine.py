@@ -22,6 +22,7 @@ import sys
 import json
 import time
 import math
+import errno
 import socket
 import argparse
 import logging
@@ -136,6 +137,88 @@ def _release_state_lock(fd: Optional[int]) -> None:
             os.unlink(_STATE_LOCK_FILE)
         except OSError:
             pass
+
+
+# ─── Patched-engine timing constants (patchable so tests run fast) ─────────
+ENTRY_SETTLE_POLL_S = 0.8    # wait between entry-fill confirmation checks
+ENTRY_SETTLE_TRIES = 8       # number of entry-fill checks (~6.4s window)
+SL_STATUS_SLEEP = 0.5        # wait before first SL order status check
+SL_RETRY_SLEEP = 1.0         # wait between SL placement attempts
+FLATTEN_POLL_S = 0.5         # wait between flatten-order status polls
+FLATTEN_POLL_N = 10          # status polls per flatten order before unresolved
+FINALIZE_SLEEP = 1.0         # wait before journal reconciliation
+MONITOR_POLL_S = 5            # wait between live-monitor iterations
+
+
+def _safe_get_positions(client) -> Optional[List[Dict]]:
+    """
+    P1 fail-closed position read. Returns the position list ONLY on a verified
+    success response; returns None (= UNKNOWN) on any exception or non-success
+    response. Callers must treat None as 'cannot verify' — never as 'flat'.
+    """
+    try:
+        resp = client.dhan.get_positions()
+    except Exception:
+        return None
+    if (not isinstance(resp, dict) or resp.get("status") != "success"
+            or not isinstance(resp.get("data"), list)):
+        return None
+    return resp["data"]
+
+
+def _broker_flat(client) -> Optional[bool]:
+    """True only when the position book is verified readable AND all netQty == 0."""
+    positions = _safe_get_positions(client)
+    if positions is None:
+        return None
+    return all(int(p.get("netQty", 0)) == 0 for p in positions)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        return e.errno == errno.EPERM
+    return True
+
+
+def acquire_engine_lock() -> Optional[int]:
+    """
+    P5 single-owner engine lock. One tick owns the engine for the whole trading
+    transaction (scan -> entry -> monitor); a concurrent tick is a no-op.
+    A stale lock is broken ONLY after verifying the recorded PID is dead.
+    """
+    path = os.path.join(BASE_DIR, ".survivor_engine.lock")
+    for _ in range(3):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            return fd
+        except FileExistsError:
+            try:
+                with open(path, "r") as f:
+                    pid = int((f.read() or "0").strip())
+                if pid and not _pid_alive(pid):
+                    os.unlink(path)   # verified-dead owner: safe to break
+                    continue
+            except (ValueError, OSError):
+                pass
+            return None   # live owner (or unreadable lock): duplicate tick -> skip
+    return None
+
+
+def release_engine_lock(fd: Optional[int]) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.unlink(os.path.join(BASE_DIR, ".survivor_engine.lock"))
+    except OSError:
+        pass
+
 
 
 def load_state() -> Dict:
@@ -446,8 +529,8 @@ class SurvivorDhanClient:
             m["exp_date"] = m["SEM_EXPIRY_DATE"].astype(str).str[:10]
             valid_exps = sorted([e for e in m["exp_date"].unique() if e > today_str])
             if not valid_exps:
-                valid_exps = sorted([e for e in m["exp_date"].unique() if e >= today_str])
-            if not valid_exps:
+                # P6: hard 0DTE ban — no same-day-expiry fallback, ever.
+                logger.warning("0DTE guard: no future expiry listed; refusing same-day expiry (no fallback).")
                 return None
             target_expiry = valid_exps[0]
 
@@ -487,6 +570,8 @@ class SurvivorDhanClient:
                     "iv": 15.0,
                     "oi": vol,
                     "score": round(score, 2),
+                    # P7: this quote is MANUFACTURED from candles/constants — never tradable.
+                    "synthetic": True,
                 })
 
             if not candidates:
@@ -517,9 +602,9 @@ class SurvivorDhanClient:
         # expiry-day gamma/theta whipsaws or newly minted strikes with 0 historical chart bars.
         valid_expiries = [e for e in expiries if e > today_str]
         if not valid_expiries:
-            valid_expiries = [e for e in expiries if e >= today_str]
-        if not valid_expiries:
-            return self._fallback_option_from_security_master(direction, max_lot_cost, under_security_id, lot_size, index_name, today_str)
+            # P6: hard 0DTE ban — if only same-day expiry is listed, do not trade it.
+            logger.warning("0DTE guard: only same-day expiry available; refusing 0DTE (no fallback to today).")
+            return None
         target_expiry = valid_expiries[0]
 
         oc_resp = self.dhan.option_chain(
@@ -601,8 +686,29 @@ class SurvivorDhanClient:
         candidates.sort(key=lambda x: x["score"], reverse=True)
         return candidates[0]
 
-    def emergency_flatten_all(self) -> List[str]:
-        """Cancel all pending orders and market-close all open intraday positions."""
+    def _poll_order_terminal(self, oid) -> Optional[str]:
+        """P3: poll a broker order to a terminal status (TRADED/REJECTED/CANCELLED) or None (unresolved)."""
+        for _ in range(FLATTEN_POLL_N):
+            time.sleep(FLATTEN_POLL_S)
+            try:
+                st = self.dhan.get_order_by_id(oid)
+                d = st.get("data") if isinstance(st, dict) else None
+                if isinstance(d, list) and d:
+                    d = d[0]
+                s = (d or {}).get("orderStatus")
+                if s in ("TRADED", "REJECTED", "CANCELLED"):
+                    return s
+            except Exception:
+                pass
+        return None
+
+    def emergency_flatten_all(self, max_retries: int = 3) -> List[str]:
+        """
+        Cancel all pending orders and market-close all open intraday positions.
+        P3 verified flatten: every exit order is POLLED to a terminal status;
+        REJECTED/unresolved exits are retried, and persistent failure is reported
+        explicitly ('STILL OPEN') instead of being logged as success.
+        """
         actions = []
         try:
             orders_resp = self.dhan.get_order_list()
@@ -616,19 +722,22 @@ class SurvivorDhanClient:
         except Exception as e:
             actions.append(f"Order cancel warning: {e}")
 
-        try:
-            pos_resp = self.dhan.get_positions()
-            positions = pos_resp.get("data", []) if isinstance(pos_resp, dict) else []
-            for p in positions:
-                net_qty = int(p.get("netQty", 0))
-                if net_qty == 0:
-                    continue
-                sec_id = str(p.get("securityId"))
-                exch = p.get("exchangeSegment", "NSE_EQ")
-                prod = p.get("productType", "INTRADAY")
-                sym = p.get("tradingSymbol", sec_id)
-                txn = self.dhan.SELL if net_qty > 0 else self.dhan.BUY
-                qty = abs(net_qty)
+        positions = _safe_get_positions(self)
+        if positions is None:
+            actions.append("Flatten INCOMPLETE: position API unavailable — position state unverified")
+            return actions
+        for p in positions:
+            net_qty = int(p.get("netQty", 0))
+            if net_qty == 0:
+                continue
+            sec_id = str(p.get("securityId"))
+            exch = p.get("exchangeSegment", "NSE_EQ")
+            prod = p.get("productType", "INTRADAY")
+            sym = p.get("tradingSymbol", sec_id)
+            txn = self.dhan.SELL if net_qty > 0 else self.dhan.BUY
+            qty = abs(net_qty)
+            filled = False
+            for attempt in range(max_retries):
                 res = self.place_order_with_ip_retry(
                     security_id=sec_id,
                     exchange_segment=exch,
@@ -638,37 +747,52 @@ class SurvivorDhanClient:
                     product_type=prod,
                     price=0,
                 )
-                actions.append(f"Flattened {qty}x {sym} ({exch}) -> {res.get('status')}")
-        except Exception as e:
-            actions.append(f"Position flatten error: {e}")
-
+                if res.get("status") != "success":
+                    actions.append(f"Flatten submit-failed (attempt {attempt+1}/{max_retries}) for {qty}x {sym}: {res.get('remarks')}")
+                    continue
+                oid = res.get("data", {}).get("orderId")
+                status = self._poll_order_terminal(oid)
+                if status == "TRADED":
+                    actions.append(f"Flattened {qty}x {sym} ({exch}) -> TRADED (order {oid})")
+                    filled = True
+                    break
+                actions.append(f"Flatten order {oid} -> {status or 'UNRESOLVED'} (attempt {attempt+1}/{max_retries})")
+            if not filled:
+                actions.append(f"Flatten FAILED after {max_retries} attempts: {qty}x {sym} STILL OPEN")
         return actions
 
     def place_protective_sl_order(self, security_id: str, exchange_segment: str,
                                   transaction_type: str, quantity: int,
-                                  trigger_price: float, product_type: str = "INTRADAY") -> Optional[str]:
+                                  trigger_price: float, product_type: str = "INTRADAY") -> Dict:
         """
-        Place an exchange-side STOP_LOSS (SL-L) order on Dhan so positions are protected
-        every second between cron heartbeats.
-        CRITICAL FIX (Day 2): Wait up to 3.5s to verify the parent entry order is settled in
-        `get_positions()` (`netQty != 0`) before placing the offsetting SL-L order. Otherwise,
-        Dhan RMS treats a millisecond-later SELL SL as a naked option short requiring ₹1.39L margin!
-        DAY 5 RETRY FIX: Retry SL placement up to 3 times if Dhan RMS rejects it.
+        P2 fill-confirmed protective SL. Returns a dict:
+          {"placed": <orderId or None>, "rejected": bool, "filled_qty": int}
+        - filled_qty == 0  -> the entry NEVER confirmed in the position book:
+          NO SL is placed (fail-closed). The caller cancels the pending entry and aborts.
+        - rejected == True -> a live position exists but no exchange SL could be
+          placed after 3 attempts: the caller must market-flatten (fail-closed).
+        - The SL quantity is capped at the ACTUAL filled quantity — a partial fill
+          is never over-hedged.
         """
-        for _ in range(4):
-            time.sleep(0.8)
-            try:
-                pos_resp = self.dhan.get_positions()
-                positions = pos_resp.get("data", []) if isinstance(pos_resp, dict) else []
-                if any(str(p.get("securityId")) == str(security_id) and int(p.get("netQty", 0)) != 0 for p in positions):
-                    break
-            except Exception:
-                pass
+        filled_qty = 0
+        for _ in range(ENTRY_SETTLE_TRIES):
+            time.sleep(ENTRY_SETTLE_POLL_S)
+            positions = _safe_get_positions(self)
+            if positions is not None:
+                for p in positions:
+                    if str(p.get("securityId")) == str(security_id) and int(p.get("netQty", 0)) != 0:
+                        filled_qty = abs(int(p.get("netQty", 0)))
+                        break
+            if filled_qty:
+                break
+        if filled_qty == 0:
+            logger.warning(f"Entry fill NOT confirmed for {security_id} within settle window; no SL placed.")
+            return {"placed": None, "rejected": False, "filled_qty": 0}
 
-        # NSE Option & Equity tick size is ₹0.05 across all NSE_FNO and NSE_EQ contracts
+        qty = min(int(quantity), filled_qty)   # P2: never over-hedge a partial fill
         tick = 0.05
 
-        # Retry loop: try up to 3 times to get the SL accepted by Dhan RMS
+        res: Dict = {}
         for attempt in range(3):
             trig = round(round(trigger_price / tick) * tick, 2)
             if transaction_type.upper() == "SELL":
@@ -680,7 +804,7 @@ class SurvivorDhanClient:
                 security_id=str(security_id),
                 exchange_segment=exchange_segment,
                 transaction_type=transaction_type,
-                quantity=int(quantity),
+                quantity=int(qty),
                 order_type=self.dhan.SL,
                 product_type=product_type,
                 price=lim_px,
@@ -689,7 +813,7 @@ class SurvivorDhanClient:
             if res.get("status") == "success":
                 oid = res.get("data", {}).get("orderId")
                 # Verify Dhan RMS didn't immediately reject the SL order
-                time.sleep(0.5)
+                time.sleep(SL_STATUS_SLEEP)
                 try:
                     st = self.dhan.get_order_by_id(oid)
                     st_data = st.get("data", {}) if isinstance(st, dict) else {}
@@ -700,20 +824,20 @@ class SurvivorDhanClient:
                         logger.warning(f"Exchange SL {oid} rejected by RMS ({err_desc}); attempt {attempt+1}/3.")
                         # On rejection, retry with slightly wider limit price cushion
                         if attempt < 2:
-                            time.sleep(1.0)
+                            time.sleep(SL_RETRY_SLEEP)
                             continue
-                        logger.warning(f"SL order rejected 3x; relying on 5s live monitor only.")
-                        return None
+                        logger.warning("SL order rejected 3x with a LIVE position; caller must flatten (fail-closed).")
+                        return {"placed": None, "rejected": True, "filled_qty": qty}
                 except Exception:
                     pass
-                return oid
+                return {"placed": oid, "rejected": False, "filled_qty": qty}
             else:
                 logger.warning(f"SL order placement attempt {attempt+1}/3 failed: {res}")
                 if attempt < 2:
-                    time.sleep(1.0)
+                    time.sleep(SL_RETRY_SLEEP)
                     continue
         logger.warning(f"Failed to place exchange-side SL order after 3 attempts: {res}")
-        return None
+        return {"placed": None, "rejected": True, "filled_qty": qty}
 
 
 # ─── Technical Indicators & Fast-Strike Signal Engine (3-Min Scalper) ──────
@@ -1308,13 +1432,37 @@ def cmd_status(live_Orders: bool = False) -> None:
     print("=" * 68)
 
 
+def _abort_unfilled_entry(client: "SurvivorDhanClient", trade_record: Dict) -> None:
+    """
+    P2 fail-closed entry abort: the entry order never confirmed a fill within the
+    settle window. Cancel the pending entry if it is still resting, and never
+    record the trade as open (no SL was placed, no daily count consumed).
+    """
+    oid = trade_record.get("order_id")
+    if oid:
+        try:
+            st = client.dhan.get_order_by_id(oid)
+            d = st.get("data") if isinstance(st, dict) else None
+            if isinstance(d, list) and d:
+                d = d[0]
+            status = (d or {}).get("orderStatus", "")
+            if status in ("PENDING", "TRANSIT"):
+                client.dhan.cancel_order(oid)
+                print(f"↩️ Entry never filled; cancelled pending entry order {oid}.")
+            else:
+                print(f"↩️ Entry order {oid} in terminal state '{status}'; nothing to cancel.")
+        except Exception as e:
+            logger.warning(f"Entry abort check failed for order {oid}: {e}")
+    print(f"⛔ Entry aborted without a confirmed fill: {trade_record.get('symbol')} (fail-closed).")
+
+
 def _finalize_closed_trade(client: SurvivorDhanClient, state: Dict, active: Dict, reason: str, fallback_exit_px: float) -> None:
     """
     Sync actual broker fill from Dhan order book (`get_order_list`) for this specific trade's orders
     (avoiding multi-trade cumulative `get_positions` double-counting on the same securityId),
     and enforce the ₹1,500+ Daily Green Target Lock!
     """
-    time.sleep(1.0)
+    time.sleep(FINALIZE_SLEEP)
     sec_id = str(active["security_id"])
     entry_px = float(active["entry_price"])
     exit_px = float(fallback_exit_px)
@@ -1419,6 +1567,17 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
         if not active:
             return
 
+        # P4: honor a pending flatten — this trade must EXIT, never be managed or re-entered
+        if active.get("flatten_pending"):
+            if live:
+                client.emergency_flatten_all()
+                if _broker_flat(client):
+                    _finalize_closed_trade(client, state, active, "HALT_FLATTENED",
+                                           float(active.get("stop_loss", 0) or active.get("entry_price", 0)))
+                    return
+            save_state(state)
+            return
+
         now_ist = datetime.now(IST)
         hhmm = now_ist.strftime("%H:%M")
         sec_id = str(active["security_id"])
@@ -1436,16 +1595,25 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
             return
 
         # 2. Check if Exchange SL order already closed the position on Dhan
+        #    P1 fail-closed: only a VERIFIED success response may be interpreted;
+        #    unknown position state never finalizes a trade.
         if live:
-            try:
-                pos_resp = client.dhan.get_positions()
-                positions = pos_resp.get("data", []) if isinstance(pos_resp, dict) else []
+            positions = _safe_get_positions(client)
+            if positions is None:
+                fails = state.get("pos_check_failures", 0) + 1
+                state["pos_check_failures"] = fails
+                if fails >= 3:
+                    state["entries_blocked_reason"] = "position API unreliable (3+ consecutive unverified reads)"
+                save_state(state)
+            else:
+                if state.get("pos_check_failures"):
+                    state["pos_check_failures"] = 0
+                    if str(state.get("entries_blocked_reason", "")).startswith("position API unreliable"):
+                        state.pop("entries_blocked_reason", None)
                 open_sec_ids = {str(p.get("securityId")) for p in positions if int(p.get("netQty", 0)) != 0}
                 if sec_id not in open_sec_ids:
                     _finalize_closed_trade(client, state, active, "EXCHANGE_SL_FILLED", float(active["stop_loss"]))
                     return
-            except Exception:
-                pass
 
         # 3. Poll live LTP from 1-min candles
         df_1m = client.fetch_candles(sec_id, exchange_segment=exch, instrument_type=inst, days_back=2, resample_tf="1min")
@@ -1514,7 +1682,7 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
                 _finalize_closed_trade(client, state, active, reason, curr_ltp)
                 return
 
-        time.sleep(5)
+        time.sleep(MONITOR_POLL_S)
 
     # Hand off cleanly to next 5-minute cron tick if still open after 260s
     active = state.get("active_trade")
@@ -1527,6 +1695,24 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
 def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
     """
     Single autonomous heartbeat tick (designed to run every 5 min during market hours).
+    P5 single-owner engine lock: the WHOLE tick (scan -> entry -> monitor) runs under
+    the engine lock; a concurrent duplicate tick (cron overlap, monitor handoff gap)
+    is skipped, never run in parallel with the owner.
+    """
+    lock_fd = acquire_engine_lock()
+    if lock_fd is None:
+        print("⏭️ [ENGINE LOCK] Another tick owns the engine; duplicate tick skipped.")
+        return
+    try:
+        _cmd_tick_inner(live=live, quiet_scan=quiet_scan)
+    finally:
+        release_engine_lock(lock_fd)
+
+
+def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
+    """
+    Inner tick body (previous cmd_tick logic) — always invoked via cmd_tick()
+    so the single-owner engine lock is enforced.
     When `quiet_scan=True` (used by `no_agent=True` zero-token cron jobs), routine idle/scan/cooldown
     ticks produce EMPTY stdout so Telegram is only pinged on actual trade entries, trade exits,
     EOD square-offs, daily target locks, or mortality events!
@@ -1581,18 +1767,52 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
               f"Bot will auto-arm as soon as balance reaches ₹{ARMING_THRESHOLD:,.0f}+.")
         return
 
+    # 1.5 RESTART RECOVERY & ORPHAN RECONCILIATION (P8, verified reads only)
+    if live:
+        _positions = _safe_get_positions(client)
+        if _positions is None:
+            state["entries_blocked_reason"] = "position API unavailable at startup reconciliation"
+            save_state(state)
+        else:
+            state.pop("entries_blocked_reason", None)
+            _open_sec = {str(p.get("securityId")) for p in _positions if int(p.get("netQty", 0)) != 0}
+            _active = state.get("active_trade")
+            if _active:
+                if str(_active.get("security_id")) not in _open_sec:
+                    # Position closed while the engine was down: reconcile from broker records
+                    _finalize_closed_trade(client, state, _active, "RESTART_RECONCILED_CLOSED",
+                                           float(_active.get("stop_loss", 0) or _active.get("entry_price", 0) or 0.0))
+                    print("♻️ [RESTART RECOVERY] Trade was closed while the engine was down; reconciled from broker records.")
+            elif _open_sec:
+                _actions = client.emergency_flatten_all()
+                print(f"♻️ [RESTART RECOVERY] Flattened {len(_open_sec)} orphan position(s): {_actions}")
+
     state["peak_equity"] = max(state["peak_equity"], net_liq)
     tier = get_survival_tier(net_liq)
 
     # 2. DAILY CIRCUIT BREAKER CHECK
     daily_pnl = net_liq - state.get("daily_start_equity", net_liq)
     if daily_pnl <= -tier["daily_max_loss_inr"]:
-        if open_pos:
-            client.emergency_flatten_all()
         already_halted = state.get("daily_halted", False)
         state["daily_halted"] = True
         state["daily_halt_reason"] = f"Daily loss limit hit (₹{daily_pnl:,.2f} <= -₹{tier['daily_max_loss_inr']:,.2f})"
-        state["active_trade"] = None
+        if open_pos or state.get("active_trade"):
+            if live:
+                actions = client.emergency_flatten_all()
+                flat = _broker_flat(client)
+            else:
+                actions = ["Dry-run halt flatten"]
+                flat = True
+            # P4: the trade may only be cleared after a VERIFIED flat.
+            if flat:
+                if state.get("active_trade"):
+                    _finalize_closed_trade(client, state, state["active_trade"], "HALT_FLATTENED",
+                                           float(state["active_trade"].get("stop_loss", 0)
+                                                 or state["active_trade"].get("entry_price", 0)))
+                state["active_trade"] = None
+            elif state.get("active_trade"):
+                state["active_trade"]["flatten_pending"] = True
+                print(f"⚠️ Halt flatten INCOMPLETE (position possibly still open; will retry next tick): {actions}")
         save_state(state)
         if not (quiet_scan and already_halted):
             print(f"🛑 Daily survival circuit breaker triggered: {state['daily_halt_reason']}. Resting until tomorrow.")
@@ -1601,9 +1821,18 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
     # 3. MANDATORY EOD INTRADAY SQUARE-OFF (3:10 PM IST onwards)
     if hhmm >= "15:10":
         if open_pos or state.get("active_trade"):
-            actions = client.emergency_flatten_all() if live else ["Dry-run EOD flatten"]
-            if state.get("active_trade"):
+            if live:
+                actions = client.emergency_flatten_all()
+                flat = _broker_flat(client)
+            else:
+                actions = ["Dry-run EOD flatten"]
+                flat = True
+            # P4: EOD finalize only after verified flat; otherwise keep retrying next tick.
+            if flat and state.get("active_trade"):
                 _finalize_closed_trade(client, state, state["active_trade"], "EOD_SQUARE_OFF", float(state["active_trade"].get("entry_price", 0.0)))
+                state["active_trade"] = None
+            elif not flat and state.get("active_trade"):
+                state["active_trade"]["flatten_pending"] = True
             save_state(state)
             print(f"🌆 EOD Intraday Square-off executed at {hhmm} IST: {actions}")
         else:
@@ -1621,6 +1850,10 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
     if state.get("daily_halted"):
         if not quiet_scan:
             print(f"⏸️ Daily halt active: {state.get('daily_halt_reason')}")
+        return
+    if state.get("entries_blocked_reason"):
+        if not quiet_scan:
+            print(f"⛔ Entries blocked: {state.get('entries_blocked_reason')}")
         return
     if not ("09:20" <= hhmm <= "14:15"):
         save_state(state)
@@ -1670,6 +1903,13 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
             if not quiet_scan:
                 print(f"🛡️ [ANTI-REVENGE COOLDOWN] Skipping {idx_sig['signal']} signal — 30m cooldown active after recent Stop-Loss in same direction.")
             return
+        # P8: remaining-risk budget — never risk more than the daily halt allows
+        remaining_budget = tier["daily_max_loss_inr"] + daily_pnl
+        if tier["risk_per_trade_inr"] > max(0.0, remaining_budget):
+            if not quiet_scan:
+                print(f"🛡️ [RISK BUDGET] Per-trade risk ₹{tier['risk_per_trade_inr']:,.0f} exceeds remaining daily budget ₹{remaining_budget:,.0f}; no entry.")
+            save_state(state)
+            return
         opt = client.get_nearest_nifty_option(
             idx_sig["signal"],
             max_lot_cost=avail * 0.45,
@@ -1677,6 +1917,11 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
             lot_size=int(best_idx_cfg["lot_size"]),
             index_name=best_idx_cfg["symbol_prefix"],
         )
+        if opt and opt.get("synthetic"):
+            # P7: fabricated fallback quotes are never tradable
+            if not quiet_scan:
+                print("🚫 [SYNTHETIC-QUOTE GUARD] Option-chain unavailable; refusing to trade fabricated fallback quotes.")
+            opt = None
         if opt:
             opt_ok, opt_chart_msg = verify_option_chart_momentum(client, opt["security_id"])
             if opt_ok:
@@ -1729,8 +1974,8 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
                         print(f"⚠️ Option order rejected by Dhan: {res}")
                         return
                     trade_record["order_id"] = res.get("data", {}).get("orderId")
-                    # Place Exchange-Side Protective Stop-Loss (SL-L) AFTER confirming position settled in Dhan
-                    sl_oid = client.place_protective_sl_order(
+                    # P2: fill-confirmed protective SL (no naked SL, no over-hedged partial fills)
+                    sl = client.place_protective_sl_order(
                         security_id=opt["security_id"],
                         exchange_segment="NSE_FNO",
                         transaction_type=client.dhan.SELL,
@@ -1738,7 +1983,20 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
                         trigger_price=sl_px,
                         product_type=client.dhan.INTRA,
                     )
-                    trade_record["sl_order_id"] = sl_oid
+                    if sl["filled_qty"] == 0:
+                        # Entry never confirmed: cancel any pending entry and abort (fail-closed)
+                        _abort_unfilled_entry(client, trade_record)
+                        save_state(state)
+                        return
+                    trade_record["quantity"] = min(int(trade_record["quantity"]), int(sl["filled_qty"]))
+                    if sl["rejected"]:
+                        # Live position with NO exchange-side SL: market-flatten immediately (fail-closed)
+                        state["daily_trades_count"] += 1
+                        actions = client.emergency_flatten_all()
+                        _finalize_closed_trade(client, state, trade_record, "UNPROTECTED_POSITION_FLATTENED", entry_px)
+                        print(f"🛑 Exchange SL could not be placed; position market-flattened (fail-closed): {actions}")
+                        return
+                    trade_record["sl_order_id"] = sl["placed"]
 
                 state["active_trade"] = trade_record
                 state["daily_trades_count"] += 1
@@ -1754,6 +2012,13 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
         if cooldown_dir == eq_cand["direction"]:
             if not quiet_scan:
                 print(f"🛡️ [ANTI-REVENGE COOLDOWN] Skipping Equity {eq_cand['direction']} — 30m cooldown active.")
+            return
+        # P8: remaining-risk budget — never risk more than the daily halt allows
+        remaining_budget = tier["daily_max_loss_inr"] + daily_pnl
+        if tier["risk_per_trade_inr"] > max(0.0, remaining_budget):
+            if not quiet_scan:
+                print(f"🛡️ [RISK BUDGET] Per-trade risk ₹{tier['risk_per_trade_inr']:,.0f} exceeds remaining daily budget ₹{remaining_budget:,.0f}; no equity entry.")
+            save_state(state)
             return
         entry_px = eq_cand["ltp"]
         atr = eq_cand["atr"]
@@ -1809,7 +2074,8 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
                 print(f"⚠️ Equity order rejected by Dhan: {res}")
                 return
             trade_record["order_id"] = res.get("data", {}).get("orderId")
-            sl_oid = client.place_protective_sl_order(
+            # P2: fill-confirmed protective SL (no naked SL, no over-hedged partial fills)
+            sl = client.place_protective_sl_order(
                 security_id=eq_cand["security_id"],
                 exchange_segment="NSE_EQ",
                 transaction_type=sl_txn,
@@ -1817,7 +2083,18 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
                 trigger_price=sl_px,
                 product_type=client.dhan.INTRA,
             )
-            trade_record["sl_order_id"] = sl_oid
+            if sl["filled_qty"] == 0:
+                _abort_unfilled_entry(client, trade_record)
+                save_state(state)
+                return
+            trade_record["quantity"] = min(int(trade_record["quantity"]), int(sl["filled_qty"]))
+            if sl["rejected"]:
+                state["daily_trades_count"] += 1
+                actions = client.emergency_flatten_all()
+                _finalize_closed_trade(client, state, trade_record, "UNPROTECTED_POSITION_FLATTENED", entry_px)
+                print(f"🛑 Exchange SL could not be placed; position market-flattened (fail-closed): {actions}")
+                return
+            trade_record["sl_order_id"] = sl["placed"]
 
         state["active_trade"] = trade_record
         state["daily_trades_count"] += 1
