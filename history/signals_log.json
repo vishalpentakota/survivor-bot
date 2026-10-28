@@ -1,0 +1,702 @@
+[
+  {
+    "index": "Nifty 50",
+    "timestamp": "2026-08-03 09:30:00+05:30",
+    "close": 24554.7,
+    "ema_fast": 24443.34,
+    "ema_slow": 24391.75,
+    "rsi": 75.66,
+    "atr": 44.75,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Bank",
+    "timestamp": "2026-08-03 09:30:00+05:30",
+    "close": 57597.9,
+    "ema_fast": 57382.13,
+    "ema_slow": 57276.02,
+    "rsi": 72.27,
+    "atr": 101.03,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Auto",
+    "timestamp": "2026-08-03 09:30:00+05:30",
+    "close": 28922.3,
+    "ema_fast": 28808.82,
+    "ema_slow": 28690.99,
+    "rsi": 75.36,
+    "atr": 79.29,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Pharma",
+    "timestamp": "2026-08-03 09:30:00+05:30",
+    "close": 26464.3,
+    "ema_fast": 26533.97,
+    "ema_slow": 26544.02,
+    "rsi": 40.48,
+    "atr": 94.54,
+    "signal": -1
+  },
+  {
+    "index": "Nifty IT",
+    "timestamp": "2026-08-03 09:30:00+05:30",
+    "close": 30864.25,
+    "ema_fast": 30765.27,
+    "ema_slow": 30810.89,
+    "rsi": 53.37,
+    "atr": 101.86,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Metal",
+    "timestamp": "2026-08-03 09:30:00+05:30",
+    "close": 12837.0,
+    "ema_fast": 12772.98,
+    "ema_slow": 12746.76,
+    "rsi": 68.6,
+    "atr": 41.9,
+    "signal": 0
+  },
+  {
+    "index": "Nifty FMCG",
+    "timestamp": "2026-08-03 09:30:00+05:30",
+    "close": 49929.1,
+    "ema_fast": 49398.55,
+    "ema_slow": 49329.38,
+    "rsi": 74.81,
+    "atr": 157.61,
+    "signal": 1
+  },
+  {
+    "index": "Nifty 50",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 24563.65,
+    "ema_fast": 24467.93,
+    "ema_slow": 24404.71,
+    "rsi": 76.3,
+    "atr": 42.8,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Bank",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 57804.05,
+    "ema_fast": 57493.49,
+    "ema_slow": 57326.7,
+    "rsi": 78.08,
+    "atr": 116.41,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Auto",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 28895.55,
+    "ema_fast": 28829.12,
+    "ema_slow": 28707.41,
+    "rsi": 69.78,
+    "atr": 87.96,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Pharma",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 26472.05,
+    "ema_fast": 26522.77,
+    "ema_slow": 26539.19,
+    "rsi": 41.51,
+    "atr": 101.62,
+    "signal": 0
+  },
+  {
+    "index": "Nifty IT",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 30922.05,
+    "ema_fast": 30798.02,
+    "ema_slow": 30819.72,
+    "rsi": 56.93,
+    "atr": 122.09,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Metal",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 12834.2,
+    "ema_fast": 12788.14,
+    "ema_slow": 12754.48,
+    "rsi": 66.42,
+    "atr": 46.06,
+    "signal": 0
+  },
+  {
+    "index": "Nifty FMCG",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 49961.7,
+    "ema_fast": 49504.7,
+    "ema_slow": 49373.45,
+    "rsi": 75.53,
+    "atr": 158.84,
+    "signal": 0
+  },
+  {
+    "index": "Nifty 50",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 24567.15,
+    "ema_fast": 24468.63,
+    "ema_slow": 24404.97,
+    "rsi": 76.55,
+    "atr": 43.27,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Bank",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 57806.85,
+    "ema_fast": 57494.05,
+    "ema_slow": 57326.9,
+    "rsi": 78.15,
+    "atr": 117.28,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Auto",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 28896.1,
+    "ema_fast": 28829.23,
+    "ema_slow": 28707.45,
+    "rsi": 69.85,
+    "atr": 87.96,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Pharma",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 26463.9,
+    "ema_fast": 26521.14,
+    "ema_slow": 26538.59,
+    "rsi": 40.7,
+    "atr": 101.62,
+    "signal": 0
+  },
+  {
+    "index": "Nifty IT",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 30943.7,
+    "ema_fast": 30802.35,
+    "ema_slow": 30821.33,
+    "rsi": 58.12,
+    "atr": 122.09,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Metal",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 12841.6,
+    "ema_fast": 12789.62,
+    "ema_slow": 12755.03,
+    "rsi": 68.32,
+    "atr": 46.06,
+    "signal": 0
+  },
+  {
+    "index": "Nifty FMCG",
+    "timestamp": "2026-08-03 09:45:00+05:30",
+    "close": 49925.25,
+    "ema_fast": 49497.41,
+    "ema_slow": 49370.75,
+    "rsi": 74.79,
+    "atr": 158.99,
+    "signal": 0
+  },
+  {
+    "index": "Nifty 50",
+    "timestamp": "2026-08-03 11:00:00+05:30",
+    "close": 24595.95,
+    "ema_fast": 24548.05,
+    "ema_slow": 24462.61,
+    "rsi": 78.83,
+    "atr": 31.15,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Bank",
+    "timestamp": "2026-08-03 11:00:00+05:30",
+    "close": 57784.6,
+    "ema_fast": 57680.98,
+    "ema_slow": 57468.9,
+    "rsi": 75.04,
+    "atr": 88.48,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Auto",
+    "timestamp": "2026-08-03 11:00:00+05:30",
+    "close": 28956.95,
+    "ema_fast": 28906.51,
+    "ema_slow": 28782.26,
+    "rsi": 67.71,
+    "atr": 79.83,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Pharma",
+    "timestamp": "2026-08-03 11:00:00+05:30",
+    "close": 26627.35,
+    "ema_fast": 26603.03,
+    "ema_slow": 26571.84,
+    "rsi": 56.18,
+    "atr": 86.3,
+    "signal": 0
+  },
+  {
+    "index": "Nifty IT",
+    "timestamp": "2026-08-03 11:00:00+05:30",
+    "close": 31105.75,
+    "ema_fast": 31005.69,
+    "ema_slow": 30912.75,
+    "rsi": 64.16,
+    "atr": 101.45,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Metal",
+    "timestamp": "2026-08-03 11:00:00+05:30",
+    "close": 12840.65,
+    "ema_fast": 12816.21,
+    "ema_slow": 12778.17,
+    "rsi": 64.93,
+    "atr": 34.12,
+    "signal": 0
+  },
+  {
+    "index": "Nifty FMCG",
+    "timestamp": "2026-08-03 11:00:00+05:30",
+    "close": 49827.2,
+    "ema_fast": 49769.33,
+    "ema_slow": 49543.75,
+    "rsi": 64.51,
+    "atr": 127.73,
+    "signal": 0
+  },
+  {
+    "index": "Nifty 50",
+    "timestamp": "2026-08-03 13:45:00+05:30",
+    "close": 24591.35,
+    "ema_fast": 24587.37,
+    "ema_slow": 24536.17,
+    "rsi": 69.75,
+    "atr": 20.95,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Bank",
+    "timestamp": "2026-08-03 13:45:00+05:30",
+    "close": 57721.35,
+    "ema_fast": 57722.26,
+    "ema_slow": 57624.22,
+    "rsi": 61.94,
+    "atr": 63.57,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Auto",
+    "timestamp": "2026-08-03 13:45:00+05:30",
+    "close": 28896.65,
+    "ema_fast": 28928.21,
+    "ema_slow": 28872.31,
+    "rsi": 54.03,
+    "atr": 47.55,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Pharma",
+    "timestamp": "2026-08-03 13:45:00+05:30",
+    "close": 26522.4,
+    "ema_fast": 26581.22,
+    "ema_slow": 26585.95,
+    "rsi": 41.15,
+    "atr": 45.43,
+    "signal": -1
+  },
+  {
+    "index": "Nifty IT",
+    "timestamp": "2026-08-03 13:45:00+05:30",
+    "close": 31373.65,
+    "ema_fast": 31324.34,
+    "ema_slow": 31151.65,
+    "rsi": 71.02,
+    "atr": 72.11,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Metal",
+    "timestamp": "2026-08-03 13:45:00+05:30",
+    "close": 12895.75,
+    "ema_fast": 12868.02,
+    "ema_slow": 12827.55,
+    "rsi": 70.08,
+    "atr": 23.3,
+    "signal": 0
+  },
+  {
+    "index": "Nifty FMCG",
+    "timestamp": "2026-08-03 13:45:00+05:30",
+    "close": 49637.05,
+    "ema_fast": 49671.42,
+    "ema_slow": 49622.6,
+    "rsi": 51.2,
+    "atr": 86.28,
+    "signal": 0
+  },
+  {
+    "index": "Nifty 50",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 24617.85,
+    "ema_fast": 24619.14,
+    "ema_slow": 24574.92,
+    "rsi": 55.16,
+    "atr": 59.32,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Bank",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 57806.0,
+    "ema_fast": 57813.6,
+    "ema_slow": 57713.85,
+    "rsi": 53.95,
+    "atr": 182.28,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Auto",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 28999.05,
+    "ema_fast": 28972.65,
+    "ema_slow": 28917.68,
+    "rsi": 56.01,
+    "atr": 98.71,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Pharma",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 26442.8,
+    "ema_fast": 26504.07,
+    "ema_slow": 26538.33,
+    "rsi": 42.79,
+    "atr": 90.9,
+    "signal": 0
+  },
+  {
+    "index": "Nifty IT",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 31430.95,
+    "ema_fast": 31448.32,
+    "ema_slow": 31298.4,
+    "rsi": 57.24,
+    "atr": 122.77,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Metal",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 13010.55,
+    "ema_fast": 12931.33,
+    "ema_slow": 12873.91,
+    "rsi": 75.41,
+    "atr": 43.3,
+    "signal": 0
+  },
+  {
+    "index": "Nifty FMCG",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 49623.45,
+    "ema_fast": 49667.78,
+    "ema_slow": 49641.66,
+    "rsi": 49.31,
+    "atr": 154.29,
+    "signal": 0
+  },
+  {
+    "index": "Nifty 50",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 24617.55,
+    "ema_fast": 24619.08,
+    "ema_slow": 24574.9,
+    "rsi": 55.13,
+    "atr": 59.28,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Bank",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 57807.4,
+    "ema_fast": 57813.88,
+    "ema_slow": 57713.95,
+    "rsi": 54.0,
+    "atr": 182.28,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Auto",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 29000.45,
+    "ema_fast": 28972.93,
+    "ema_slow": 28917.78,
+    "rsi": 56.09,
+    "atr": 98.71,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Pharma",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 26436.2,
+    "ema_fast": 26502.75,
+    "ema_slow": 26537.84,
+    "rsi": 42.4,
+    "atr": 90.9,
+    "signal": 0
+  },
+  {
+    "index": "Nifty IT",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 31420.55,
+    "ema_fast": 31446.24,
+    "ema_slow": 31297.63,
+    "rsi": 56.81,
+    "atr": 121.94,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Metal",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 13009.3,
+    "ema_fast": 12931.08,
+    "ema_slow": 12873.82,
+    "rsi": 75.09,
+    "atr": 43.3,
+    "signal": 0
+  },
+  {
+    "index": "Nifty FMCG",
+    "timestamp": "2026-08-04 09:30:00+05:30",
+    "close": 49628.45,
+    "ema_fast": 49668.78,
+    "ema_slow": 49642.03,
+    "rsi": 49.52,
+    "atr": 154.29,
+    "signal": 0
+  },
+  {
+    "index": "Nifty 50",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 24644.85,
+    "ema_fast": 24583.23,
+    "ema_slow": 24562.13,
+    "rsi": 65.97,
+    "atr": 32.57,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Bank",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 57814.7,
+    "ema_fast": 57674.1,
+    "ema_slow": 57642.95,
+    "rsi": 62.71,
+    "atr": 89.19,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Auto",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 29262.55,
+    "ema_fast": 29320.73,
+    "ema_slow": 29296.93,
+    "rsi": 47.16,
+    "atr": 65.93,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Pharma",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 26700.4,
+    "ema_fast": 26593.75,
+    "ema_slow": 26544.12,
+    "rsi": 70.08,
+    "atr": 46.73,
+    "signal": 0
+  },
+  {
+    "index": "Nifty IT",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 31396.95,
+    "ema_fast": 31350.31,
+    "ema_slow": 31364.16,
+    "rsi": 53.22,
+    "atr": 105.52,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Metal",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 13238.6,
+    "ema_fast": 13199.3,
+    "ema_slow": 13126.21,
+    "rsi": 76.55,
+    "atr": 38.88,
+    "signal": 0
+  },
+  {
+    "index": "Nifty FMCG",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 49324.9,
+    "ema_fast": 49314.97,
+    "ema_slow": 49316.5,
+    "rsi": 50.63,
+    "atr": 64.06,
+    "signal": 0
+  },
+  {
+    "index": "Nifty 50",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 24631.8,
+    "ema_fast": 24580.62,
+    "ema_slow": 24561.16,
+    "rsi": 63.95,
+    "atr": 33.98,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Bank",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 57777.4,
+    "ema_fast": 57666.64,
+    "ema_slow": 57640.19,
+    "rsi": 60.23,
+    "atr": 92.47,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Auto",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 29287.6,
+    "ema_fast": 29325.74,
+    "ema_slow": 29298.78,
+    "rsi": 49.33,
+    "atr": 69.84,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Pharma",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 26642.2,
+    "ema_fast": 26582.11,
+    "ema_slow": 26539.81,
+    "rsi": 63.74,
+    "atr": 50.15,
+    "signal": 0
+  },
+  {
+    "index": "Nifty IT",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 31332.8,
+    "ema_fast": 31337.48,
+    "ema_slow": 31359.41,
+    "rsi": 47.34,
+    "atr": 110.9,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Metal",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 13223.95,
+    "ema_fast": 13196.37,
+    "ema_slow": 13125.13,
+    "rsi": 72.75,
+    "atr": 42.08,
+    "signal": 0
+  },
+  {
+    "index": "Nifty FMCG",
+    "timestamp": "2026-08-06 09:30:00+05:30",
+    "close": 49306.6,
+    "ema_fast": 49311.31,
+    "ema_slow": 49315.15,
+    "rsi": 49.04,
+    "atr": 65.68,
+    "signal": 0
+  },
+  {
+    "index": "Nifty 50",
+    "timestamp": "2026-08-07 11:45:00+05:30",
+    "close": 24568.95,
+    "ema_fast": 24583.65,
+    "ema_slow": 24601.68,
+    "rsi": 39.85,
+    "atr": 25.35,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Bank",
+    "timestamp": "2026-08-07 11:45:00+05:30",
+    "close": 57775.85,
+    "ema_fast": 57832.77,
+    "ema_slow": 57871.68,
+    "rsi": 38.83,
+    "atr": 74.08,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Auto",
+    "timestamp": "2026-08-07 11:45:00+05:30",
+    "close": 29430.7,
+    "ema_fast": 29398.06,
+    "ema_slow": 29308.08,
+    "rsi": 63.88,
+    "atr": 69.84,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Pharma",
+    "timestamp": "2026-08-07 11:45:00+05:30",
+    "close": 26432.4,
+    "ema_fast": 26487.0,
+    "ema_slow": 26539.57,
+    "rsi": 27.85,
+    "atr": 40.61,
+    "signal": 0
+  },
+  {
+    "index": "Nifty IT",
+    "timestamp": "2026-08-07 11:45:00+05:30",
+    "close": 31456.9,
+    "ema_fast": 31471.67,
+    "ema_slow": 31401.4,
+    "rsi": 54.2,
+    "atr": 90.71,
+    "signal": 0
+  },
+  {
+    "index": "Nifty Metal",
+    "timestamp": "2026-08-07 11:45:00+05:30",
+    "close": 13105.75,
+    "ema_fast": 13115.37,
+    "ema_slow": 13129.45,
+    "rsi": 41.52,
+    "atr": 20.51,
+    "signal": 0
+  },
+  {
+    "index": "Nifty FMCG",
+    "timestamp": "2026-08-07 11:45:00+05:30",
+    "close": 49465.0,
+    "ema_fast": 49476.29,
+    "ema_slow": 49430.76,
+    "rsi": 53.95,
+    "atr": 67.64,
+    "signal": 0
+  }
+]

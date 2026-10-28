@@ -1,0 +1,31 @@
+17:55:31 [INFO] warrior: Downloading https://archives.nseindia.com/content/historical/EQUITIES/2026/AUG/cm08AUG2026bhav.csv.zip
+17:55:32 [INFO] warrior: Downloading https://archives.nseindia.com/content/historical/EQUITIES/2026/AUG/cm07AUG2026bhav.csv.zip
+17:55:32 [INFO] warrior: Downloading https://archives.nseindia.com/content/historical/EQUITIES/2026/AUG/cm06AUG2026bhav.csv.zip
+17:55:32 [INFO] warrior: Downloading https://archives.nseindia.com/content/historical/EQUITIES/2026/AUG/cm05AUG2026bhav.csv.zip
+17:55:32 [ERROR] warrior: All Bhavcopy downloads failed
+17:56:19 [INFO] warrior: Loaded 20 NSE equities from cache
+17:56:19 [INFO] warrior: Scanning 12 stocks in ₹50-₹500 range...
+18:01:00 [INFO] warrior: Loaded 20 NSE equities from cache
+18:01:00 [INFO] warrior: Scanning 12 stocks in ₹50-₹500 range...
+18:01:03 [INFO] warrior: Built security map: 2450 NSE EQ symbols
+18:01:25 [INFO] warrior: Built security map: 2450 NSE EQ symbols
+12:31:54 [INFO] warrior: Cached token near expiry, will renew.
+12:31:55 [INFO] warrior: Loaded 20 NSE equities from cache
+12:31:55 [INFO] warrior: Scanning 12 stocks in ₹50-₹500 range...
+12:31:56 [INFO] warrior: Token renewed successfully. Expires: 2026-08-11 11:31:56.513653
+12:31:56 [INFO] warrior: Account: VISHAL  PENTAKOTA ([REDACTED])
+12:31:57 [INFO] warrior: Built security map: 2450 NSE EQ symbols
+12:36:29 [INFO] warrior: Loaded 20 NSE equities from cache
+12:36:29 [INFO] warrior: Scanning 12 stocks (yfinance, ₹50-₹500)...
+12:36:29 [INFO] warrior: Built yfinance ticker map: 20 symbols
+12:36:33 [INFO] warrior: Got live quotes for 12/12 symbols
+12:38:42 [INFO] warrior: Loaded 126 NSE equities from cache
+12:38:42 [INFO] warrior: Built yfinance ticker map: 126 symbols
+12:38:42 [INFO] warrior: Scanning 126 stocks (yfinance, ₹50-₹500)...
+12:38:52 [ERROR] warrior: HTTP Error 404: {"quoteSummary":{"result":null,"error":{"code":"Not Found","description":"Quote not found for symbol: TATAMOTORS.NS"}}}
+12:39:08 [INFO] warrior: Got live quotes for 123/126 symbols
+09:47:44 [INFO] warrior: Loaded 126 NSE equities from cache
+09:47:44 [INFO] warrior: Built yfinance ticker map: 126 symbols
+09:47:44 [INFO] warrior: Scanning 126 stocks (yfinance, ₹50-₹500)...
+09:47:57 [ERROR] warrior: HTTP Error 404: {"quoteSummary":{"result":null,"error":{"code":"Not Found","description":"Quote not found for symbol: TATAMOTORS.NS"}}}
+09:48:21 [INFO] warrior: Got live quotes for 123/126 symbols

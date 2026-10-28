@@ -1,0 +1,15 @@
+# Not approved for live execution
+- Engine snapshot is preserved for continuity, not certified safe. Source-string assertions from prior sessions were NOT behavioral validation.
+- Option fallback manufactures bid/ask, delta, theta, IV and OI from candles/constants. Disable/replace with independently verified real quotes; never trade these placeholders.
+- Same-day expiry remains possible in fallback branches despite earlier claims of a ban.
+- Lot sizes, tick sizes and expiry rules must be read from current instrument metadata, not historic hardcoding.
+- Per-file state locks do not serialize entire trading transactions. Use one engine owner and process-wide lock; test stale-state/overlap recovery.
+- Position API failure may be interpreted as no position. Fail closed; do not falsely finalize trades.
+- Fill confirmation, partial fills, rejected protection and flatten completion need behavioral tests.
+- Journal contains known unreliable inferred exits/aggregated fills. Reconcile against broker contract notes before relying on P&L or win counts.
+- Daily loss limits can overshoot; size against remaining daily risk and actual charges. Profit goals are not guarantees.
+- Scans are sequential despite historic 'parallel' wording. Monitor polls candle closes, not true tick quotes; handoff gaps exist.
+- Pre-market currently labels historical bars as healthy and may ignore pending orders in overall result. Require correct trading calendar, timestamp freshness, SDK/API health and safe startup recovery.
+- Pre-market/ensure_ip_whitelisted can mutate IP whitelist in original engine; do not invoke. IP changes require explicit authorization and must not overwrite both slots blindly.
+- Shared cloud NAT egress is not reserved. Stop/start and failover can change it.
+- Original supporting scripts can contain their own direct broker logic. They are reference-only; run only cloud_probe.py and tests in this staging build.
