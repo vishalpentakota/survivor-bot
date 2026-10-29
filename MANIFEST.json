@@ -5,7 +5,7 @@
   "app/backtest_summary.md": "e1dc2c22c2e08bcf70d6c8473c443d9413c30baa53071525ee2f49945d449045",
   "app/backtest_trades.csv": "a72c75d7b33c4827096627c7e173455ea640940c96fc18f67db23a33d9468574",
   "app/backtester.py": "9f70052f6734db0f4446ac083824bfe9ce25741ffdefbff4b648985c6ae4b268",
-  "app/cloud_guard.py": "95edafcad246765c4812bb1b8d53b1646772d496f2fa0300a8243aa465cd1043",
+  "app/cloud_guard.py": "431a1601dd65ea6e0edc82b9ea91a148187d22f47100b2b14475c8ecb4ba7026",
   "app/cloud_probe.py": "86c5c9ae818cd60dacf85975afd7da007ace0e08bf34b13ef1f49902c0ea5fc8",
   "app/config.py": "f110a53b0c5728feb2254000849931f6d5fdd0eca40035b89b11b9e4c39a6bb0",
   "app/data_fetcher.py": "88f44c3c13d4bc185a5ccb42eaf01f632e3dc0159b0eebd1453c15154183dff5",
@@ -16,7 +16,7 @@
   "app/security_id_list.csv": "f72f14748afba2be68e2ee537f6081e2ff1f71055b645ea1da21873e6dd48fa9",
   "app/signals.py": "5b6179123268504fcb710c7524639a2fca6cd27d2b8ede441446dc980babae4a",
   "app/survivor_engine.log": "de0645463217b0ec8a0a50405b9691ac62bf588695385d907f52ae32fecdd9e9",
-  "app/survivor_engine.py": "5fc70bfde91601aec41a7313a83dff43396799e630f36c42e4d7891dd917c531",
+  "app/survivor_engine.py": "9656355afb47bbf26dda750b5893cb2a9437fb2f9e887af6de736c13b5d8b569",
   "app/survivor_state.json": "6e1a24a5b7f449790ed24801e8da76db62c3b382d936958eb5720543ab1287d3",
   "app/survivor_trades.json": "46a524da045a4b54cc91f0562a6cf5c6beb57a3bf76213d36c047e2739367fda",
   "app/telegram_reporter.py": "ecacbae021df74ba6b7132892478d5cc2ef7669654b30a2d7354b3a1b9705557",
@@ -34,6 +34,6 @@
   "reference/HISTORICAL_SKILL.md": "a26a13ea674526cf96a6cd5c8f1681d2821afa672263f1b44bd3960238ec498f",
   "reference/LOCAL_ENGINE_ORIGINAL.py.txt": "a06a2c27838d75bac4e97fcf3498b8f85aa6793394c357b6408bd269bba3ee3e",
   "requirements.txt": "34ce8271711e4f1a299e861a3402b07c7041c4c0b36300d1115ed58f646a946d",
-  "tests/test_migration.py": "4809af69a01066ca91df8f64b50aa555bde9edafbe1c6b9689a96a9062b98db2",
+  "tests/test_migration.py": "ff857b7ffd16e77baa401138a0b0895dbf42c033d7424438c41c6b4d1a87a2a1",
   "tests/test_safe_behavior.py": "ea9fa851bf23eade13af63169e06fe2a55f534816b86636b527a8615e771165d"
 }

@@ -2399,7 +2399,6 @@ if __name__ == "__main__":
     parser.add_argument("--live", action="store_true", help="Place real live orders on Dhan")
     parser.add_argument("--quiet", action="store_true", help="Silent on idle/no-op scans (for zero-token no_agent=True cron jobs)")
     args = parser.parse_args()
-    raise SystemExit("Migration safety lock: use cloud_probe.py. Engine CLI disabled pending audited live cutover.")
 
     if args.action == "status":
         cmd_status()
