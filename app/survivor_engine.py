@@ -926,6 +926,20 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["atr"] = tr.rolling(14).mean().bfill()
 
+    # ── Phase 1 (1.2): ADX(14) — market regime filter ──
+    # +DM / -DM
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    # Smooth with Wilder's EMA (alpha = 1/14)
+    atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
+    plus_di = 100.0 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean() / atr14.replace(0, np.nan)
+    minus_di = 100.0 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/14, adjust=False).mean() / atr14.replace(0, np.nan)
+    dx = (100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
+    df["adx"] = dx.ewm(alpha=1/14, adjust=False).mean().fillna(0.0)
+    df["regime"] = np.where(df["adx"] >= 20.0, "TRENDING", "CHOPPY")
+
     # Supertrend (10, 2.0)
     st_line, st_dir = compute_supertrend(df, period=10, multiplier=2.0)
     df["supertrend"] = st_line
@@ -966,6 +980,19 @@ def evaluate_index_signal(df: pd.DataFrame) -> Dict:
     st_val = float(curr["supertrend"])
     macd_hist = float(curr["macd_hist"])
     prev_macd_hist = float(prev["macd_hist"])
+    adx = float(curr.get("adx", 0.0))
+    regime = str(curr.get("regime", "TRENDING"))
+
+    # ── Phase 1 (1.2): Regime filter — skip entries in choppy markets ──
+    # ADX < 20 means no clear trend → EMA crossover signals whipsaw.
+    # Log the regime so Telegram probe can track how often we sit out.
+    if regime == "CHOPPY":
+        return {
+            "signal": "NONE",
+            "reason": f"[REGIME_FILTER] ADX={adx:.1f} < 20 → CHOPPY, no entry",
+            "adx": round(adx, 1),
+            "regime": regime,
+        }
 
     # Compute today's Opening Range (first 2 bars of 3-min = 09:15 to 09:21 IST)
     today_date = df.index[-1].date()
@@ -1491,6 +1518,12 @@ def _finalize_closed_trade(client: SurvivorDhanClient, state: Dict, active: Dict
                 # Most recent traded exit order on this securityId (orders list is newest-first)
                 if exit_px == float(fallback_exit_px):
                     exit_px = round(avg_px, 2)
+                # Phase 1 (1.3): pull actual fill qty from the broker's SELL order,
+                # not the stale state quantity (which may reflect a partial SL fill).
+                if o.get("transactionType") == "SELL":
+                    traded_qty = int(o.get("tradedQuantity", 0) or o.get("quantity", 0) or 0)
+                    if traded_qty > 0:
+                        qty = traded_qty
     except Exception:
         pass
 
