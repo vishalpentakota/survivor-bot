@@ -57,6 +57,12 @@ logging.basicConfig(
 logger = logging.getLogger("survivor")
 
 # ─── Core Survival Constants ───────────────────────────────────────────────
+# P9 RECOVERY-MODE PROTECTIONS (drafted 2026-11-16, vnext reference tree):
+GREEN_FLOOR_INR = 500.0        # banked-profit floor: keep trading while green, never give ₹500+ back
+MAX_ENTRIES_PER_SETUP = 2      # max entries per setup+security per day (no 3rd chase of the same breakout)
+ENTRY_RSI_CEILING_LONG = 72.0  # no exhaustion chasing on LONG entries (day-3 audit: RSI 78-83 re-buys)
+ENTRY_RSI_FLOOR_SHORT = 28.0   # symmetric exhaustion floor for SHORT entries
+EQUITY_STALE_MINS = 20.0       # flat equity position exited after 20 min going nowhere (was 30/unbounded)
 SEED_CAPITAL = 30000.0
 MAX_LOSS_PCT = 0.89
 DEATH_FLOOR = round(SEED_CAPITAL * (1.0 - MAX_LOSS_PCT), 2)  # ₹3,300.00
@@ -182,27 +188,55 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _get_tick_size(security_id: str, exchange_segment: str = "") -> float:
+    cache_file = os.path.join(BASE_DIR, ".tick_size_cache.json")
+    try:
+        if os.path.exists(cache_file):
+            with open(cache_file) as f:
+                cache = json.load(f)
+            key = str(security_id)
+            if key in cache:
+                return float(cache[key])
+    except (json.JSONDecodeError, OSError, ValueError):
+        pass
+    # Default NSE tick (matches the proven live-tree implementation)
+    return 0.05
+
+
 def acquire_engine_lock() -> Optional[int]:
     """
     P5 single-owner engine lock. One tick owns the engine for the whole trading
     transaction (scan -> entry -> monitor); a concurrent tick is a no-op.
-    A stale lock is broken ONLY after verifying the recorded PID is dead.
+    A stale lock is broken if the recorded PID is dead OR if the lock is older
+    than 4 minutes (process may be stuck in the monitor loop).
     """
     path = os.path.join(BASE_DIR, ".survivor_engine.lock")
     for _ in range(3):
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
+            os.write(fd, f"{os.getpid()}:{time.time()}".encode())
             return fd
         except FileExistsError:
             try:
                 with open(path, "r") as f:
-                    pid = int((f.read() or "0").strip())
-                if pid and not _pid_alive(pid):
-                    os.unlink(path)   # verified-dead owner: safe to break
+                    content = f.read().strip()
+                if ":" in content:
+                    pid_str, ts_str = content.split(":", 1)
+                    pid = int(pid_str)
+                    lock_ts = float(ts_str)
+                else:
+                    pid = int(content)
+                    lock_ts = 0.0
+                # Break if PID is dead OR lock is older than 4 minutes
+                if (pid and not _pid_alive(pid)) or (time.time() - lock_ts > 240):
+                    os.unlink(path)
                     continue
             except (ValueError, OSError):
-                pass
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                continue
             return None   # live owner (or unreadable lock): duplicate tick -> skip
     return None
 
@@ -794,7 +828,7 @@ class SurvivorDhanClient:
             return {"placed": None, "rejected": False, "filled_qty": 0}
 
         qty = min(int(quantity), filled_qty)   # P2: never over-hedge a partial fill
-        tick = 0.05
+        tick = _get_tick_size(security_id, exchange_segment)
 
         res: Dict = {}
         for attempt in range(3):
@@ -1019,7 +1053,7 @@ def evaluate_index_signal(df: pd.DataFrame) -> Dict:
 
     # --- Setup 1: Morning Opening Range Breakout (09:20 - 10:35 IST) ---
     if orb_high and orb_low and ("09:20" <= hhmm <= "10:35"):
-        if st_dir == 1 and intraday_bull_ok and prev["close"] <= orb_high * 1.0008 and close > ema9 and rsi >= 54.0:
+        if st_dir == 1 and intraday_bull_ok and prev["close"] <= orb_high * 1.0008 and close > ema9 and 54.0 <= rsi <= ENTRY_RSI_CEILING_LONG:
             return {
                 "signal": "LONG",
                 "setup": "ORB_IGNITE",
@@ -1034,7 +1068,7 @@ def evaluate_index_signal(df: pd.DataFrame) -> Dict:
                 "atr": round(atr, 2),
                 "reason": f"[ORB_IGNITE LONG] 3m Close {close:.1f} broke ORB High {orb_high:.1f} | ST(10,2)={st_label} ({st_val:.1f}) | RSI={rsi:.1f}",
             }
-        if st_dir == -1 and intraday_bear_ok and prev["close"] >= orb_low * 0.9992 and close < ema9 and rsi <= 46.0:
+        if st_dir == -1 and intraday_bear_ok and prev["close"] >= orb_low * 0.9992 and close < ema9 and ENTRY_RSI_FLOOR_SHORT <= rsi <= 46.0:
             return {
                 "signal": "SHORT",
                 "setup": "ORB_IGNITE",
@@ -1488,6 +1522,34 @@ def _abort_unfilled_entry(client: "SurvivorDhanClient", trade_record: Dict) -> N
     print(f"⛔ Entry aborted without a confirmed fill: {trade_record.get('symbol')} (fail-closed).")
 
 
+def _today_entries(journal: list, setup: str = None, direction: str = None, security_id=None) -> list:
+    """P9: today's closed journal entries, optionally filtered by setup/direction/security.
+    direction matches EITHER instrument direction OR underlying_direction (options carry both)."""
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    out = []
+    for t in journal:
+        if not str(t.get("entry_time", "")).startswith(today_str):
+            continue
+        if setup and t.get("setup") != setup:
+            continue
+        if security_id is not None and str(t.get("security_id")) != str(security_id):
+            continue
+        if direction and t.get("direction") != direction and t.get("underlying_direction") != direction:
+            continue
+        out.append(t)
+    return out
+
+
+def _day_peak_net(journal: list) -> float:
+    """P9: peak running day-net after each completed trade (best banked point of the day)."""
+    cum = 0.0
+    peak = 0.0
+    for t in _today_entries(journal):
+        cum = round(cum + float(t.get("net_pnl", 0.0)), 2)
+        peak = max(peak, cum)
+    return peak
+
+
 def _finalize_closed_trade(client: SurvivorDhanClient, state: Dict, active: Dict, reason: str, fallback_exit_px: float) -> None:
     """
     Sync actual broker fill from Dhan order book (`get_order_list`) for this specific trade's orders
@@ -1580,10 +1642,15 @@ def _finalize_closed_trade(client: SurvivorDhanClient, state: Dict, active: Dict
         if state["daily_consecutive_losses"] >= 2:
             state["daily_halted"] = True
             state["daily_halt_reason"] = "2 consecutive losses — daily survival shield engaged"
-        elif today_net_pnl >= 600.0:
-            # If we were already nicely green on the day and took 1 pullback loss, protect the remaining green day!
-            state["daily_halted"] = True
-            state["daily_halt_reason"] = f"🛡️ Protecting Green Day after pullback (Net banked: ₹{today_net_pnl:+,.2f})"
+        else:
+            # P9 GREEN FLOOR: do NOT halt while green (maximize recovery), but once ₹500+ net was
+            # banked today, a pullback that breaches the floor halts the day — banked profit is protected.
+            _peak_net = _day_peak_net(journal)
+            if _peak_net >= GREEN_FLOOR_INR and today_net_pnl < GREEN_FLOOR_INR:
+                state["daily_halted"] = True
+                state["daily_halt_reason"] = (
+                    f"🛡️ Green floor ₹{GREEN_FLOOR_INR:.0f} breached (day peak ₹{_peak_net:+,.2f} -> ₹{today_net_pnl:+,.2f}) — protecting banked profit"
+                )
 
     state["active_trade"] = None
     save_state(state)
@@ -1670,19 +1737,24 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
                 gross_pnl = pts_gain * qty
                 hit_sl = curr_ltp <= float(active["stop_loss"])
                 hit_tp = curr_ltp >= float(active["target_price"])
-                stale_kill = (active["weapon"] == "OPTIONS" and held_mins >= 25.0 and pts_gain < 4.0)
+                if active["weapon"] == "OPTIONS":
+                    stale_kill = (held_mins >= 25.0 and pts_gain < 4.0)
+                else:
+                    # P9: equity LONG going nowhere exits after EQUITY_STALE_MINS
+                    stale_kill = (held_mins >= EQUITY_STALE_MINS and pts_gain <= 0)
 
                 # Step-1 Breakeven Lock at +5.5 pts (+₹357) -> SL moves to Entry + 2.00
                 # Step-2 Profit-Lock Ratchet at +10.0 pts (+₹650) -> SL locks 65% of peak gain!
+                _ts = _get_tick_size(str(active.get("security_id", "")))
                 new_sl = float(active["stop_loss"])
                 if active["weapon"] == "OPTIONS":
                     if peak_pts >= 10.0:
-                        new_sl = max(new_sl, round(round((entry_px + peak_pts * 0.65) / 0.05) * 0.05, 2))
+                        new_sl = max(new_sl, round(round((entry_px + peak_pts * 0.65) / _ts) * _ts, 2))
                     elif peak_pts >= 5.5:
-                        new_sl = max(new_sl, round(round((entry_px + 2.00) / 0.05) * 0.05, 2))
+                        new_sl = max(new_sl, round(round((entry_px + 2.00) / _ts) * _ts, 2))
                 else:
                     if pts_gain >= 0.45 * (float(active["target_price"]) - entry_px):
-                        new_sl = max(new_sl, round(round((entry_px * 1.004) / 0.05) * 0.05, 2))
+                        new_sl = max(new_sl, round(round((entry_px * 1.004) / _ts) * _ts, 2))
 
                 if new_sl > float(active["stop_loss"]):
                     active["stop_loss"] = new_sl
@@ -1690,8 +1762,9 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
                     print(f"🔒 [PROFIT LOCK RATCHET] {active['symbol']} trailed Stop-Loss up to ₹{new_sl} (Peak gain: +{peak_pts:.1f} pts)")
                     if live and active.get("sl_order_id"):
                         try:
-                            trig = round(round(new_sl / 0.05) * 0.05, 2)
-                            lim_px = round(round((trig * 0.98) / 0.05) * 0.05, 2)
+                            _ts = _get_tick_size(str(active.get("security_id", "")))
+                            trig = round(round(new_sl / _ts) * _ts, 2)
+                            lim_px = round(round((trig * 0.98) / _ts) * _ts, 2)
                             client.dhan.modify_order(
                                 order_id=active["sl_order_id"],
                                 order_type=client.dhan.SL,
@@ -1709,7 +1782,9 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
                 gross_pnl = pts_gain * qty
                 hit_sl = curr_ltp >= float(active["stop_loss"])
                 hit_tp = curr_ltp <= float(active["target_price"])
-                stale_kill = (held_mins >= 30.0 and pts_gain <= 0)
+                # P9: equity SHORT going nowhere exits after EQUITY_STALE_MINS (options keep 30m theta rule)
+                _stale_min = EQUITY_STALE_MINS if active.get("instrument_type") == "EQUITY" else 30.0
+                stale_kill = (held_mins >= _stale_min and pts_gain <= 0)
                 if pts_gain >= 0.45 * (entry_px - float(active["target_price"])):
                     active["stop_loss"] = min(float(active["stop_loss"]), round(entry_px * 0.996, 2))
 
@@ -1963,6 +2038,21 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
         if opt:
             opt_ok, opt_chart_msg = verify_option_chart_momentum(client, opt["security_id"])
             if opt_ok:
+                # P9: per-setup entry budget + never chase above the day's first fill
+                _journal = load_journal()
+                _setup = idx_sig.get("setup", "FAST_STRIKE")
+                _same_setup = _today_entries(_journal, setup=_setup, direction=idx_sig["signal"])
+                if len(_same_setup) >= MAX_ENTRIES_PER_SETUP:
+                    if not quiet_scan:
+                        print(f"🚫 [P9 SETUP BUDGET] {len(_same_setup)} entries already taken today on {_setup} {idx_sig['signal']} — no further chase (max {MAX_ENTRIES_PER_SETUP}).")
+                    save_state(state)
+                    return
+                _prior_same_sec = _today_entries(_journal, security_id=opt["security_id"], direction=idx_sig["signal"])
+                if _prior_same_sec and float(opt["ltp"]) > float(_prior_same_sec[0]["entry_price"]):
+                    if not quiet_scan:
+                        print(f"🚫 [P9 RE-ENTRY CAP] {opt['symbol']} LTP ₹{opt['ltp']} > day's first fill ₹{_prior_same_sec[0]['entry_price']} — refusing to pay up for the same signal.")
+                    save_state(state)
+                    return
                 entry_px = opt["ltp"]
                 qty = opt["lot_size"]
                 # Strict Guardrail Sizing: 8 to 10 pts max SL (~₹520-₹650 risk), 16 to 18 pts Quick Target (~+₹1,040 to +₹1,170)
@@ -2047,6 +2137,19 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
     # Weapon B: Scan 5x Intraday Liquid Equities
     eq_cand = scan_equity_candidates(client)
     if eq_cand:
+        # P9: per-security entry budget + never chase above the day's first fill
+        _journal = load_journal()
+        _eq_prior = _today_entries(_journal, security_id=eq_cand["security_id"], direction=eq_cand["direction"])
+        if len(_eq_prior) >= MAX_ENTRIES_PER_SETUP:
+            if not quiet_scan:
+                print(f"🚫 [P9 SETUP BUDGET] {len(_eq_prior)} entries already taken today on {eq_cand['symbol']} {eq_cand['direction']} — no further chase (max {MAX_ENTRIES_PER_SETUP}).")
+            save_state(state)
+            return
+        if _eq_prior and float(eq_cand["ltp"]) > float(_eq_prior[0]["entry_price"]):
+            if not quiet_scan:
+                print(f"🚫 [P9 RE-ENTRY CAP] {eq_cand['symbol']} LTP ₹{eq_cand['ltp']} > day's first fill ₹{_eq_prior[0]['entry_price']} — refusing to pay up for the same signal.")
+            save_state(state)
+            return
         if cooldown_dir == eq_cand["direction"]:
             if not quiet_scan:
                 print(f"🛡️ [ANTI-REVENGE COOLDOWN] Skipping Equity {eq_cand['direction']} — 30m cooldown active.")
@@ -2309,7 +2412,7 @@ def cmd_reconcile() -> None:
     print(f"Journal Entries Updated from Dhan Fills : {updated_count}")
     print(f"Open Positions Remaining                : {len(open_pos)} (100% Cash Overnight: {len(open_pos) == 0})")
     print(f"Gross Realized P&L (Dhan Positions)     : ₹{realized_gross_total:+,.2f}")
-    print(f"Brokerage & Statutory Charges           : ₹{round(net_liq - SEED_CAPITAL - 0.18 - realized_gross_total, 2):+,.2f}")
+    print(f"Brokerage & Statutory Charges           : ₹{ESTIMATED_ROUNDTRIP_CHARGES:+,.2f} (estimated roundtrip)")
     print(f"Net Account Equity Change vs ₹30,000.18 : ₹{round(net_liq - 30000.18, 2):+,.2f}")
     print(f"Live Account Equity (Available + Margin): ₹{net_liq:,.2f} (Available: ₹{avail:,.2f} | Margin Blocked: ₹{utilized:,.2f})")
     print(f"Distance Above ₹3,300 Death Floor       : ₹{round(net_liq - DEATH_FLOOR, 2):,.2f}")

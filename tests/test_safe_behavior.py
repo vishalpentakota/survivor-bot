@@ -199,7 +199,8 @@ class SafeBehaviorRegression(unittest.TestCase):
         # snapshot module globals we may patch per-test
         self._saved = {k: getattr(se, k) for k in
                        ("SurvivorDhanClient", "evaluate_index_signal",
-                        "verify_option_chart_momentum", "scan_equity_candidates")}
+                        "verify_option_chart_momentum", "scan_equity_candidates",
+                        "compute_indicators")}
         self.mock = MockDhan()
         se.SurvivorDhanClient = lambda: make_client(self.mock)
         seed_state()
@@ -490,6 +491,156 @@ class SafeBehaviorRegression(unittest.TestCase):
         self.run_cmd_tick()
         self.assertEqual(self.mock.real_positions[0]["netQty"], 0, "orphan position must be flattened")
         self.assertEqual(len(self.mock.placed("MARKET")), 1)
+
+
+    # ═══ P9: recovery-mode protections (green floor, setup budget, re-entry cap, RSI ceiling, stale equity) ═══
+
+    def _journal_seed(self, entries):
+        with open(se.JOURNAL_FILE, "w") as f: json.dump(entries, f)
+
+    def _entry(self, **over):
+        e = {"setup": "ORB_IGNITE", "direction": "LONG", "underlying_direction": "LONG",
+             "security_id": "99991", "entry_time": f"{TODAY}T09:50:00+05:30",
+             "entry_price": 100.0, "exit_time": f"{TODAY}T09:55:00+05:30",
+             "net_pnl": 0.0, "gross_pnl": 0.0}
+        e.update(over); return e
+
+    def _seed_state_from_file(self):
+        st = json.load(open(se.STATE_FILE))
+        st["daily_date"] = TODAY
+        json.dump(st, open(se.STATE_FILE, "w"))
+        return st
+
+    def test_p9_green_day_keeps_trading_no_halt_at_500(self):
+        # +₹569 banked and still green -> NO halt: recovery mode maximizes a green day
+        self._journal_seed([self._entry(net_pnl=517.0), self._entry(net_pnl=52.25)])
+        st = self._seed_state_from_file()
+        c = make_client(self.mock)
+        se._finalize_closed_trade(c, st, active_trade(), "TARGET_HIT", 105.0)
+        st2 = json.load(open(se.STATE_FILE))
+        self.assertFalse(st2["daily_halted"], "a win on a green day must NOT halt — maximize recovery")
+
+    def test_p9_green_floor_halts_when_banked_profit_breached(self):
+        # day peak +₹569 (>= floor) then a big loss drops today below the floor -> halt & protect
+        self._journal_seed([self._entry(net_pnl=517.0), self._entry(net_pnl=52.25)])
+        st = self._seed_state_from_file()
+        c = make_client(self.mock)
+        se._finalize_closed_trade(c, st, active_trade(), "STOP_LOSS_HIT", 85.0)   # big loss
+        st2 = json.load(open(se.STATE_FILE))
+        self.assertTrue(st2["daily_halted"], "breach of the ₹500 banked-profit floor must halt the day")
+        self.assertIn("Green floor", st2["daily_halt_reason"])
+
+    def test_p9_small_green_day_not_floored_keeps_trading(self):
+        # day peak only +₹300 (< floor): a single pullback loss must NOT halt (floor never banked)
+        self._journal_seed([self._entry(net_pnl=300.0)])
+        st = self._seed_state_from_file()
+        c = make_client(self.mock)
+        se._finalize_closed_trade(c, st, active_trade(), "STOP_LOSS_HIT", 90.0)
+        st2 = json.load(open(se.STATE_FILE))
+        self.assertFalse(st2["daily_halted"], "no halt unless the ₹500 floor was actually banked")
+
+    def test_p9_setup_budget_blocks_third_same_setup_entry(self):
+        # 2 ORB_IGNITE LONG entries done today -> a 3rd same-setup entry must be refused
+        self.enable_long_signal()
+        se.evaluate_index_signal = lambda df: {"signal": "LONG", "confidence": 99.0,
+                                               "reason": "regression", "setup": "ORB_IGNITE"}
+        self._journal_seed([self._entry(), self._entry(entry_time=f"{TODAY}T09:55:00+05:30")])
+        self.run_cmd_tick()
+        self.assertEqual(self.mock.writes(), [], "3rd entry on the same setup must be blocked")
+        st = json.load(open(se.STATE_FILE))
+        self.assertEqual(st["daily_trades_count"], 0)
+
+    def test_p9_reentry_cap_blocks_paying_above_first_fill(self):
+        # day's first fill was cheap; current LTP above it -> refuse to pay up
+        self.enable_long_signal()
+        self._journal_seed([self._entry(entry_price=0.05)])
+        self.run_cmd_tick()
+        self.assertEqual(self.mock.writes(), [], "re-entry above the day's first fill must be blocked")
+        st = json.load(open(se.STATE_FILE))
+        self.assertEqual(st["daily_trades_count"], 0)
+
+    def test_p9_reentry_allows_same_or_better_price(self):
+        # control: prior fill at a huge price -> cap does NOT block; entry proceeds
+        self.enable_long_signal()
+        self._journal_seed([self._entry(entry_price=10**9)])
+        self.run_cmd_tick()
+        self.assertNotEqual(self.mock.writes(), [], "entry at/below the day's first fill must proceed")
+
+    def _signal_df(self, rsi, *, short=False):
+        _t0 = REAL_DT(2026, 10, 28, 9, 21, 0, tzinfo=se.IST)
+        _td = __import__('datetime').timedelta
+        idx = [_t0 + _td(minutes=3*i) for i in range(25)]
+        close = [90.0]*23 + ([100.0, 90.0] if short else [100.0, 110.0])
+        d = pd.DataFrame({"open": [100.0]*25, "high": [100.0]*25, "low": [100.0]*25,
+                          "close": close, "volume": [100.0]*25}, index=idx)
+        st_dir = -1 if short else 1
+        for col, v in [("ema9", 105.0), ("ema21", 104.0), ("vwap", 100.0), ("atr", 2.0),
+                       ("supertrend", 99.0), ("macd_hist", 1.0), ("adx", 30.0)]:
+            d[col] = v
+        d["st_dir"] = st_dir
+        d["rsi"] = rsi
+        d["regime"] = "TRENDING"
+        return d
+
+    def test_p9_rsi_ceiling_blocks_exhaustion_long(self):
+        # 09:21-10:30 ORB window, all conditions green but RSI 80 (exhaustion) -> NO entry
+        orig = se.compute_indicators; se.compute_indicators = lambda df: df
+        try:
+            sig = se.evaluate_index_signal(self._signal_df(80.0))
+            self.assertEqual(sig["signal"], "NONE",
+                             "RSI 80 LONG must be blocked by the exhaustion ceiling")
+            sig60 = se.evaluate_index_signal(self._signal_df(60.0))
+            self.assertEqual(sig60["signal"], "LONG", "RSI 60 LONG in-range must still fire")
+        finally:
+            se.compute_indicators = orig
+
+    def test_p9_rsi_floor_blocks_exhaustion_short(self):
+        orig = se.compute_indicators; se.compute_indicators = lambda df: df
+        try:
+            sig = se.evaluate_index_signal(self._signal_df(20.0, short=True))
+            self.assertEqual(sig["signal"], "NONE",
+                              "RSI 20 SHORT must be blocked by the exhaustion floor")
+        finally:
+            se.compute_indicators = orig
+
+    def _equity_active(self, entry_time):
+        return active_trade(weapon="EQUITY", symbol="IRFC", security_id="46681",
+                            exchange_segment="NSE_EQ", instrument_type="EQUITY",
+                            direction="SHORT", quantity=575,
+                            entry_price=100.0, stop_loss=101.0, target_price=95.0,
+                            entry_time=f"{TODAY}T{entry_time}+05:30")
+
+    def test_p9_stale_equity_short_exits_after_20_min(self):
+        # equity position flat for >20 min exits as STALE instead of riding to the SL
+        seed_state({"active_trade": self._equity_active("10:05:00")})   # held 25 min by NOW=10:30
+        self.mock.real_positions = [{"securityId": "46681", "netQty": -575}]
+        self.mock.candles["46681"] = bars(30, 100.0, 100)   # flat LTP == entry
+        self.mock.status_queue = ["TRADED"]
+        self.run_cmd_tick()
+        j = journal()
+        self.assertEqual(j[-1]["exit_reason"], "STALE_THETA_EXIT",
+                         "flat equity position older than EQUITY_STALE_MINS must exit")
+        self.assertEqual(self.mock.real_positions[0]["netQty"], 0)
+
+    def test_p9_fresh_equity_short_not_stale_killed(self):
+        # control: held only 15 min -> no stale exit, trade stays open
+        seed_state({"active_trade": self._equity_active("10:15:00")})
+        self.mock.real_positions = [{"securityId": "46681", "netQty": -575}]
+        self.mock.candles["46681"] = bars(30, 100.0, 100)
+        self.run_cmd_tick()
+        self.assertEqual(journal(), [],
+                         "equity position younger than EQUITY_STALE_MINS must not be stale-killed")
+
+    def test_p9_equity_setup_budget_blocks_third_same_security_entry(self):
+        se.evaluate_index_signal = lambda df: {"signal": "NONE", "reason": "none"}
+        se.scan_equity_candidates = lambda client: {
+            "symbol": "IRFC", "security_id": "46681", "direction": "SHORT",
+            "ltp": 100.0, "atr": 1.0, "reason": "regression equity"}
+        self._journal_seed([self._entry(setup="EQ_SCALP", direction="SHORT", security_id="46681"),
+                            self._entry(setup="EQ_SCALP", direction="SHORT", security_id="46681")])
+        self.run_cmd_tick()
+        self.assertEqual(self.mock.writes(), [],
+                         "3rd equity entry on the same security/direction must be blocked")
 
     # ═══ Guard integrity (unchanged staging safeguard) ═══
     def test_z_guard_blocks_all_broker_writes(self):
