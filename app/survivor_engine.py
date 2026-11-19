@@ -198,9 +198,92 @@ def _get_tick_size(security_id: str, exchange_segment: str = "") -> float:
             if key in cache:
                 return float(cache[key])
     except (json.JSONDecodeError, OSError, ValueError):
-        pass
-    # Default NSE tick (matches the proven live-tree implementation)
+        cache = {}
+    # Default NSE tick
     return 0.05
+
+
+def _get_latest_tick_ltp(client: "SurvivorDhanClient", security_id: str,
+                         exchange_segment: str, instrument_type: str) -> Optional[float]:
+    """
+    Get the LATEST available live tick price from Dhan intraday data.
+    Falls back to the 1-min candle close if no tick is available.
+    Used for faster reversal detection: don't rely on stale 1-min candle closes.
+    """
+    try:
+        resp = client.dhan.intraday_minute_data(
+            security_id=str(security_id),
+            exchange_segment=exchange_segment,
+            instrument_type=instrument_type,
+            from_date=(datetime.now(IST) - timedelta(minutes=2)).strftime("%Y-%m-%d"),
+            to_date=datetime.now(IST).strftime("%Y-%m-%d"),
+        )
+        if resp.get("status") != "success":
+            return None
+        data = resp.get("data")
+        if not data or not isinstance(data, dict):
+            return None
+        ticks = []
+        ts = data.get("timestamp")
+        opn = data.get("open")
+        hi = data.get("high")
+        lo = data.get("low")
+        cl = data.get("close")
+        if ts is not None:
+            ticks.append({"ts": ts, "close": cl, "high": hi, "low": lo, "open": opn})
+        if isinstance(data.get("data"), list):
+            for m in data["data"]:
+                if isinstance(m, dict):
+                    ticks.append(m)
+        if ticks:
+            latest = ticks[-1]
+            if latest.get("close") is not None and float(latest["close"]) > 0:
+                return float(latest["close"])
+        return None
+    except Exception:
+        return None
+
+
+def _acquire_owner_lock() -> bool:
+    if os.path.exists(_OWNER_LOCK_FILE):
+        pid = None
+        try:
+            with open(_OWNER_LOCK_FILE) as f:
+                pid = int(f.read().strip())
+        except (ValueError, OSError):
+            pid = None
+        stale = False
+        if pid is None or not _pid_alive(pid):
+            stale = True
+        try:
+            age = time.time() - os.path.getmtime(_OWNER_LOCK_FILE)
+            if age > 120 and (pid is None or not _pid_alive(pid)):
+                stale = True
+        except OSError:
+            pass
+        if pid is not None and _pid_alive(pid) and not stale:
+            logger.warning(f"Another survivor owner (pid {pid}) is already running; refusing to start.")
+            return False
+        try:
+            os.unlink(_OWNER_LOCK_FILE)
+        except OSError:
+            pass
+    try:
+        with open(_OWNER_LOCK_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        return False
+    return True
+
+
+def _release_owner_lock() -> None:
+    try:
+        if os.path.exists(_OWNER_LOCK_FILE):
+            with open(_OWNER_LOCK_FILE) as f:
+                if int(f.read().strip()) == os.getpid():
+                    os.unlink(_OWNER_LOCK_FILE)
+    except (OSError, ValueError):
+        pass
 
 
 def acquire_engine_lock() -> Optional[int]:
@@ -1777,8 +1860,24 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
                             )
                         except Exception:
                             pass
-            else:
-                pts_gain = entry_px - curr_ltp
+                    # ── REVERSAL DETECTION ────────────────
+                    current_peak = float(active.get("peak_pts_gain", 0.0))
+                    if current_peak >= 2.0 and pts_gain <= -(current_peak * 0.6):
+                        # Drained ~60%+ of prior peak gain within minutes -> reversal
+                        if live:
+                            client.emergency_flatten_all()
+                        _finalize_closed_trade(client, state, active, "REVERSAL_BAILOUT", curr_ltp)
+                        return
+                else:
+                    # Price after entry: trail SL to current gain (not just peak)
+                    # This is the "intelligence" gap: old code only used peak_pts
+                    cur_gain_pct = 0.30 if active["weapon"] == "OPTIONS" else 0.20
+                    trailed_sl = round(round((entry_px + pts_gain * cur_gain_pct) / 0.05) * 0.05, 2)
+                    if pts_gain < 0:
+                        # Price below entry: reset SL just under current price
+                        trailed_sl = round(round((curr_ltp - 0.10) / 0.05) * 0.05, 2)
+                    if trailed_sl > float(active["stop_loss"]):
+                        new_sl = trailed_sl
                 gross_pnl = pts_gain * qty
                 hit_sl = curr_ltp >= float(active["stop_loss"])
                 hit_tp = curr_ltp <= float(active["target_price"])
