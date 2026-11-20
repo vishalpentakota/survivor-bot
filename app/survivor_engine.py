@@ -206,39 +206,38 @@ def _get_tick_size(security_id: str, exchange_segment: str = "") -> float:
 def _get_latest_tick_ltp(client: "SurvivorDhanClient", security_id: str,
                          exchange_segment: str, instrument_type: str) -> Optional[float]:
     """
-    Get the LATEST available live tick price from Dhan intraday data.
-    Falls back to the 1-min candle close if no tick is available.
-    Used for faster reversal detection: don't rely on stale 1-min candle closes.
+    Freshest available price from Dhan intraday minute data (last 1-min close,
+    including the in-progress minute when the API returns it). Returns None on
+    any failure so the caller falls back to the 1-min candle close.
+    Dhan returns OHLC as PARALLEL ARRAYS: {"open": [...], "close": [...]}.
+    (fix 2026-11-20: the previous parser expected scalars and always returned
+    None, which silently disabled the entire monitor loop.)
     """
     try:
         resp = client.dhan.intraday_minute_data(
             security_id=str(security_id),
             exchange_segment=exchange_segment,
             instrument_type=instrument_type,
-            from_date=(datetime.now(IST) - timedelta(minutes=2)).strftime("%Y-%m-%d"),
+            from_date=datetime.now(IST).strftime("%Y-%m-%d"),
             to_date=datetime.now(IST).strftime("%Y-%m-%d"),
         )
-        if resp.get("status") != "success":
+        if not isinstance(resp, dict):
             return None
         data = resp.get("data")
-        if not data or not isinstance(data, dict):
+        if not isinstance(data, dict):
             return None
-        ticks = []
-        ts = data.get("timestamp")
-        opn = data.get("open")
-        hi = data.get("high")
-        lo = data.get("low")
-        cl = data.get("close")
-        if ts is not None:
-            ticks.append({"ts": ts, "close": cl, "high": hi, "low": lo, "open": opn})
-        if isinstance(data.get("data"), list):
-            for m in data["data"]:
-                if isinstance(m, dict):
-                    ticks.append(m)
-        if ticks:
-            latest = ticks[-1]
-            if latest.get("close") is not None and float(latest["close"]) > 0:
-                return float(latest["close"])
+        payloads = [data]
+        if isinstance(data.get("data"), dict):
+            payloads.append(data["data"])
+        for payload in payloads:
+            closes = payload.get("close")
+            if isinstance(closes, (list, tuple)) and len(closes):
+                try:
+                    last = float(closes[-1])
+                except (TypeError, ValueError):
+                    continue
+                if last > 0:
+                    return last
         return None
     except Exception:
         return None
@@ -1803,96 +1802,109 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
                     _finalize_closed_trade(client, state, active, "EXCHANGE_SL_FILLED", float(active["stop_loss"]))
                     return
 
-        # 3. Poll live LTP from 1-min candles
-        df_1m = client.fetch_candles(sec_id, exchange_segment=exch, instrument_type=inst, days_back=2, resample_tf="1min")
-        if not df_1m.empty:
-            curr_ltp = float(df_1m.iloc[-1]["close"])
-            try:
-                entry_dt = datetime.fromisoformat(active["entry_time"])
-                held_mins = (now_ist - entry_dt).total_seconds() / 60.0
-            except Exception:
-                held_mins = 0.0
+        # 3. Resolve current LTP: prefer the latest intraday tick, fall back to
+        #    the 1-min candle close. The monitoring logic below runs on EVERY
+        #    poll regardless of tick availability (fix 2026-11-20: this whole
+        #    block was accidentally nested inside the tick-lookup branch, so
+        #    when the tick API returned nothing the engine went blind and rode
+        #    a +Rs945 peak all the way back to the original SL).
+        df_1m = client.fetch_candles(sec_id, exchange_segment=exch, instrument_type=inst,
+                                      days_back=1, resample_tf="1min")
+        curr_ltp = float(df_1m.iloc[-1]["close"]) if not df_1m.empty else 0.0
+        _tick_ltp = _get_latest_tick_ltp(client, sec_id, exch, inst)
+        if _tick_ltp and curr_ltp > 0 and abs(_tick_ltp - curr_ltp) / curr_ltp < 0.5:
+            curr_ltp = _tick_ltp   # fresh tick within 50% of candle close: trust it
+        if curr_ltp <= 0:
+            time.sleep(MONITOR_POLL_S)
+            continue
 
-            if active["weapon"] == "OPTIONS" or direction == "LONG":
-                pts_gain = curr_ltp - entry_px
-                peak_pts = max(float(active.get("peak_pts_gain", 0.0)), pts_gain)
-                active["peak_pts_gain"] = round(peak_pts, 2)
-                gross_pnl = pts_gain * qty
-                hit_sl = curr_ltp <= float(active["stop_loss"])
-                hit_tp = curr_ltp >= float(active["target_price"])
-                if active["weapon"] == "OPTIONS":
-                    stale_kill = (held_mins >= 25.0 and pts_gain < 4.0)
-                else:
-                    # P9: equity LONG going nowhere exits after EQUITY_STALE_MINS
-                    stale_kill = (held_mins >= EQUITY_STALE_MINS and pts_gain <= 0)
+        try:
+            entry_dt = datetime.fromisoformat(active["entry_time"])
+            held_mins = (now_ist - entry_dt).total_seconds() / 60.0
+        except Exception:
+            held_mins = 0.0
 
-                # Step-1 Breakeven Lock at +5.5 pts (+₹357) -> SL moves to Entry + 2.00
-                # Step-2 Profit-Lock Ratchet at +10.0 pts (+₹650) -> SL locks 65% of peak gain!
-                _ts = _get_tick_size(str(active.get("security_id", "")))
-                new_sl = float(active["stop_loss"])
-                if active["weapon"] == "OPTIONS":
-                    if peak_pts >= 10.0:
-                        new_sl = max(new_sl, round(round((entry_px + peak_pts * 0.65) / _ts) * _ts, 2))
-                    elif peak_pts >= 5.5:
-                        new_sl = max(new_sl, round(round((entry_px + 2.00) / _ts) * _ts, 2))
-                else:
-                    if pts_gain >= 0.45 * (float(active["target_price"]) - entry_px):
-                        new_sl = max(new_sl, round(round((entry_px * 1.004) / _ts) * _ts, 2))
+        _ts = _get_tick_size(sec_id, exch)
 
-                if new_sl > float(active["stop_loss"]):
-                    active["stop_loss"] = new_sl
-                    save_state(state)
-                    print(f"🔒 [PROFIT LOCK RATCHET] {active['symbol']} trailed Stop-Loss up to ₹{new_sl} (Peak gain: +{peak_pts:.1f} pts)")
-                    if live and active.get("sl_order_id"):
-                        try:
-                            _ts = _get_tick_size(str(active.get("security_id", "")))
-                            trig = round(round(new_sl / _ts) * _ts, 2)
-                            lim_px = round(round((trig * 0.98) / _ts) * _ts, 2)
-                            client.dhan.modify_order(
-                                order_id=active["sl_order_id"],
-                                order_type=client.dhan.SL,
-                                leg_name="NA",
-                                quantity=qty,
-                                price=lim_px,
-                                disclosed_quantity=0,
-                                trigger_price=trig,
-                                validity=client.dhan.DAY,
-                            )
-                        except Exception:
-                            pass
-                    # ── REVERSAL DETECTION ────────────────
-                    current_peak = float(active.get("peak_pts_gain", 0.0))
-                    if current_peak >= 2.0 and pts_gain <= -(current_peak * 0.6):
-                        # Drained ~60%+ of prior peak gain within minutes -> reversal
-                        if live:
-                            client.emergency_flatten_all()
-                        _finalize_closed_trade(client, state, active, "REVERSAL_BAILOUT", curr_ltp)
-                        return
-                else:
-                    # Price after entry: trail SL to current gain (not just peak)
-                    # This is the "intelligence" gap: old code only used peak_pts
-                    cur_gain_pct = 0.30 if active["weapon"] == "OPTIONS" else 0.20
-                    trailed_sl = round(round((entry_px + pts_gain * cur_gain_pct) / 0.05) * 0.05, 2)
-                    if pts_gain < 0:
-                        # Price below entry: reset SL just under current price
-                        trailed_sl = round(round((curr_ltp - 0.10) / 0.05) * 0.05, 2)
-                    if trailed_sl > float(active["stop_loss"]):
-                        new_sl = trailed_sl
-                gross_pnl = pts_gain * qty
-                hit_sl = curr_ltp >= float(active["stop_loss"])
-                hit_tp = curr_ltp <= float(active["target_price"])
-                # P9: equity SHORT going nowhere exits after EQUITY_STALE_MINS (options keep 30m theta rule)
-                _stale_min = EQUITY_STALE_MINS if active.get("instrument_type") == "EQUITY" else 30.0
-                stale_kill = (held_mins >= _stale_min and pts_gain <= 0)
-                if pts_gain >= 0.45 * (entry_px - float(active["target_price"])):
-                    active["stop_loss"] = min(float(active["stop_loss"]), round(entry_px * 0.996, 2))
+        if active["weapon"] == "OPTIONS" or direction == "LONG":
+            pts_gain = curr_ltp - entry_px
+            peak_pts = max(float(active.get("peak_pts_gain", 0.0)), pts_gain)
+            active["peak_pts_gain"] = round(peak_pts, 2)
+            gross_pnl = pts_gain * qty
+            hit_sl = curr_ltp <= float(active["stop_loss"])
+            hit_tp = curr_ltp >= float(active["target_price"])
 
-            if hit_sl or hit_tp or stale_kill:
-                reason = "TARGET_HIT" if hit_tp else ("STOP_LOSS_HIT" if hit_sl else "STALE_THETA_EXIT")
+            # REVERSAL BAILOUT: a real peak gain drained into a loss -> exit NOW
+            # instead of riding to the original stop (Nov 16-20 autopsy fix).
+            if peak_pts >= 2.0 and pts_gain <= -(peak_pts * 0.6):
                 if live:
                     client.emergency_flatten_all()
-                _finalize_closed_trade(client, state, active, reason, curr_ltp)
+                _finalize_closed_trade(client, state, active, "REVERSAL_BAILOUT", curr_ltp)
                 return
+
+            if active["weapon"] == "OPTIONS":
+                stale_kill = (held_mins >= 25.0 and pts_gain < 4.0)
+            else:
+                # P9: equity LONG going nowhere exits after EQUITY_STALE_MINS
+                stale_kill = (held_mins >= EQUITY_STALE_MINS and pts_gain <= 0)
+
+            # PROFIT LOCK RATCHET (peak-based, three tiers). A trade that was
+            # meaningfully green must NEVER close red (fix 2026-11-20).
+            new_sl = float(active["stop_loss"])
+            if active["weapon"] == "OPTIONS":
+                if peak_pts >= 8.0:
+                    new_sl = max(new_sl, round(round((entry_px + peak_pts * 0.65) / _ts) * _ts, 2))
+                elif peak_pts >= 4.0:
+                    new_sl = max(new_sl, round(round((entry_px + 2.00) / _ts) * _ts, 2))
+                elif peak_pts >= 2.0:
+                    new_sl = max(new_sl, round(round((entry_px + 0.50) / _ts) * _ts, 2))
+            else:
+                if peak_pts >= 3.0:
+                    new_sl = max(new_sl, round(round((entry_px + peak_pts * 0.50) / _ts) * _ts, 2))
+                elif peak_pts >= 1.5:
+                    new_sl = max(new_sl, round(round((entry_px + 0.30) / _ts) * _ts, 2))
+
+            if new_sl > float(active["stop_loss"]):
+                active["stop_loss"] = new_sl
+                save_state(state)
+                print(f"🔒 [PROFIT LOCK RATCHET] {active['symbol']} trailed Stop-Loss up to ₹{new_sl} (Peak gain: +{peak_pts:.1f} pts)")
+                if live and active.get("sl_order_id"):
+                    try:
+                        trig = round(round(new_sl / _ts) * _ts, 2)
+                        lim_px = round(round((trig * 0.98) / _ts) * _ts, 2)
+                        client.dhan.modify_order(
+                            order_id=active["sl_order_id"],
+                            order_type=client.dhan.SL,
+                            leg_name="NA",
+                            quantity=qty,
+                            price=lim_px,
+                            disclosed_quantity=0,
+                            trigger_price=trig,
+                            validity=client.dhan.DAY,
+                        )
+                    except Exception:
+                        pass
+            else:
+                # Persist peak_pts_gain every tick so it survives across monitor
+                # loops even when no ratchet threshold is crossed yet.
+                save_state(state)
+        else:
+            pts_gain = entry_px - curr_ltp
+            gross_pnl = pts_gain * qty
+            hit_sl = curr_ltp >= float(active["stop_loss"])
+            hit_tp = curr_ltp <= float(active["target_price"])
+            # P9: equity SHORT going nowhere exits after EQUITY_STALE_MINS (options keep 30m theta rule)
+            _stale_min = EQUITY_STALE_MINS if active.get("instrument_type") == "EQUITY" else 30.0
+            stale_kill = (held_mins >= _stale_min and pts_gain <= 0)
+            if pts_gain >= 0.45 * (entry_px - float(active["target_price"])):
+                active["stop_loss"] = min(float(active["stop_loss"]), round(entry_px * 0.996, 2))
+
+        if hit_sl or hit_tp or stale_kill:
+            reason = "TARGET_HIT" if hit_tp else ("STOP_LOSS_HIT" if hit_sl else "STALE_THETA_EXIT")
+            if live:
+                client.emergency_flatten_all()
+            _finalize_closed_trade(client, state, active, reason, curr_ltp)
+            return
 
         time.sleep(MONITOR_POLL_S)
 
