@@ -60,6 +60,10 @@ logger = logging.getLogger("survivor")
 # P9 RECOVERY-MODE PROTECTIONS (drafted 2026-11-16, vnext reference tree):
 GREEN_FLOOR_INR = 500.0        # banked-profit floor: keep trading while green, never give ₹500+ back
 MAX_ENTRIES_PER_SETUP = 2      # max entries per setup+security per day (no 3rd chase of the same breakout)
+ORB_WINDOW_START = "09:30"   # aligned with global time-of-day gate (was 09:20 -> ORB could never fire)
+ORB_WINDOW_END = "10:35"
+MIN_OPT_SESSION_BARS = 5       # current-session 3m option bars required (replaces 15 bars spanning yesterday)
+EMA21_SLOPE_ATR_MIN = 0.12     # 3-bar EMA21 slope as fraction of 3m ATR (~2.5pts on Nifty); index-agnostic
 ENTRY_RSI_CEILING_LONG = 72.0  # no exhaustion chasing on LONG entries (day-3 audit: RSI 78-83 re-buys)
 ENTRY_RSI_FLOOR_SHORT = 28.0   # symmetric exhaustion floor for SHORT entries
 EQUITY_STALE_MINS = 20.0       # flat equity position exited after 20 min going nowhere (was 30/unbounded)
@@ -664,7 +668,8 @@ class SurvivorDhanClient:
                 sec_id = str(row["SEM_SMST_SECURITY_ID"])
                 strike = float(row["strike"])
                 df_opt = self.fetch_candles(sec_id, exchange_segment="NSE_FNO", instrument_type="OPTIDX", days_back=4, resample_tf="3min")
-                if df_opt.empty or len(df_opt) < 15:
+                _sess = option_session_frame(df_opt)
+                if _sess.empty:
                     continue
                 ltp = round(float(df_opt.iloc[-1]["close"]), 2)
                 vol = int(df_opt.iloc[-1]["volume"])
@@ -1135,7 +1140,7 @@ def evaluate_index_signal(df: pd.DataFrame) -> Dict:
         intraday_bear_ok = (close < orb_low) and (close < today_open) and (close < prev["low"]) and (curr["high"] <= prev["high"])
 
     # --- Setup 1: Morning Opening Range Breakout (09:20 - 10:35 IST) ---
-    if orb_high and orb_low and ("09:20" <= hhmm <= "10:35"):
+    if orb_high and orb_low and (ORB_WINDOW_START <= hhmm <= ORB_WINDOW_END):
         if st_dir == 1 and intraday_bull_ok and prev["close"] <= orb_high * 1.0008 and close > ema9 and 54.0 <= rsi <= ENTRY_RSI_CEILING_LONG:
             return {
                 "signal": "LONG",
@@ -1203,7 +1208,9 @@ def evaluate_index_signal(df: pd.DataFrame) -> Dict:
     # Anti-Exhaustion & Anti-Chop Rules (Day 3 Audit):
     # - Do NOT enter LONG if 3m RSI > 72 (overbought exhaustion) or MACD_Hist <= 0 or EMA21 is flat/falling.
     # - Do NOT enter SHORT if 3m RSI < 30 (oversold exhaustion, e.g. 5th red candle @ RSI 26.8) or MACD_Hist >= 0 (e.g. +7.41 midday chop) or EMA21 is flat/rising.
-    ema21_slope = float(curr["ema21"]) - float(df.iloc[-4]["ema21"]) if len(df) >= 4 else 0.0
+    ema21_slope_pts = float(curr["ema21"]) - float(df.iloc[-4]["ema21"]) if len(df) >= 4 else 0.0
+    # ATR-normalised so the threshold means the same on NIFTY / BANKNIFTY / MIDCPNIFTY
+    ema21_slope = ema21_slope_pts / atr if atr > 0 else 0.0
 
     bull_align = (
         (st_dir == 1)
@@ -1212,7 +1219,7 @@ def evaluate_index_signal(df: pd.DataFrame) -> Dict:
         and (close > vwap)
         and (55.0 <= rsi <= 72.0)
         and (macd_hist > 0.0)
-        and (ema21_slope >= 2.5)
+        and (ema21_slope >= EMA21_SLOPE_ATR_MIN)
     )
     bull_spark = (close > prev["high"]) and (macd_hist > prev_macd_hist)
 
@@ -1223,7 +1230,7 @@ def evaluate_index_signal(df: pd.DataFrame) -> Dict:
         and (close < vwap)
         and (30.0 <= rsi <= 44.0)
         and (macd_hist < 0.0)
-        and (ema21_slope <= -2.5)
+        and (ema21_slope <= -EMA21_SLOPE_ATR_MIN)
     )
     bear_spark = (close < prev["low"]) and (macd_hist < prev_macd_hist)
 
@@ -1274,6 +1281,25 @@ def evaluate_index_signal(df: pd.DataFrame) -> Dict:
     }
 
 
+def option_session_frame(df_opt: pd.DataFrame) -> pd.DataFrame:
+    """Current-session bars only, with EMA9/VWAP/Supertrend computed on those bars alone
+    (no overnight-gap contamination). Returns empty frame if too few session bars."""
+    if df_opt is None or df_opt.empty:
+        return pd.DataFrame()
+    last_day = df_opt.index[-1].date()
+    sess = df_opt[df_opt.index.date == last_day].copy()
+    if len(sess) < MIN_OPT_SESSION_BARS:
+        return sess.iloc[0:0]
+    sess["ema9"] = sess["close"].ewm(span=9, adjust=False).mean()
+    typ_vol = ((sess["high"] + sess["low"] + sess["close"]) / 3.0) * sess["volume"]
+    cum_vol = sess["volume"].cumsum().replace(0, np.nan)
+    sess["vwap"] = (typ_vol.cumsum() / cum_vol).fillna(sess["close"])
+    st_line, st_dir = compute_supertrend(sess, period=10, multiplier=2.0)
+    sess["supertrend"] = st_line
+    sess["st_dir"] = st_dir
+    return sess
+
+
 def verify_option_chart_momentum(client: SurvivorDhanClient, security_id: str) -> Tuple[bool, str]:
     """
     Verify on the Option Contract's OWN 3-minute chart that:
@@ -1283,9 +1309,9 @@ def verify_option_chart_momentum(client: SurvivorDhanClient, security_id: str) -
        above its 3m EMA9 at the climax of a 5-candle spike right before a 1-min pullback wick).
     """
     df_opt = client.fetch_candles(security_id, exchange_segment="NSE_FNO", instrument_type="OPTIDX", days_back=4, resample_tf="3min")
-    if df_opt.empty or len(df_opt) < 15:
-        return False, f"OptChart Insufficient Bars ({len(df_opt)} < 15) — refusing blind entry"
-    df_opt = compute_indicators(df_opt)
+    df_opt = option_session_frame(df_opt)
+    if df_opt.empty:
+        return False, f"OptChart Insufficient Session Bars (< {MIN_OPT_SESSION_BARS} today) — refusing blind entry"
     curr = df_opt.iloc[-1]
     c = float(curr["close"])
     e9 = float(curr["ema9"])
