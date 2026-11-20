@@ -148,6 +148,7 @@ def _release_state_lock(fd: Optional[int]) -> None:
 # ─── Patched-engine timing constants (patchable so tests run fast) ─────────
 ENTRY_SETTLE_POLL_S = 0.8    # wait between entry-fill confirmation checks
 ENTRY_SETTLE_TRIES = 8       # number of entry-fill checks (~6.4s window)
+MAX_ENTRY_CHASE_PCT = 0.015  # one-shot entry re-price cap: never pay >1.5% above the original limit
 SL_STATUS_SLEEP = 0.5        # wait before first SL order status check
 SL_RETRY_SLEEP = 1.0         # wait between SL placement attempts
 FLATTEN_POLL_S = 0.5         # wait between flatten-order status polls
@@ -1604,6 +1605,91 @@ def _abort_unfilled_entry(client: "SurvivorDhanClient", trade_record: Dict) -> N
     print(f"⛔ Entry aborted without a confirmed fill: {trade_record.get('symbol')} (fail-closed).")
 
 
+def _chase_unfilled_entry(client: "SurvivorDhanClient", trade_record: Dict,
+                          security_id: str, exchange_segment: str,
+                          instrument_type: str, original_limit: float) -> bool:
+    """
+    One-shot re-price chase for an unfilled entry LIMIT order (2026-11-20).
+    Window 1: poll the position book for the normal settle window. If the fill
+    has not confirmed (the market gapped away from the limit), fetch the fresh
+    LTP and re-price the order ONCE, never paying more than
+    original_limit * (1 + MAX_ENTRY_CHASE_PCT). A gap beyond the cap, a failed
+    modify, or a second unfilled window returns False -> the caller runs the
+    fail-closed abort (cancel pending order, no trade recorded).
+    """
+    def _filled() -> bool:
+        positions = _safe_get_positions(client)
+        if positions is None:
+            return False
+        for p in positions:
+            if str(p.get("securityId")) == str(security_id) and int(p.get("netQty", 0)) != 0:
+                return True
+        return False
+
+    for _ in range(ENTRY_SETTLE_TRIES):
+        time.sleep(ENTRY_SETTLE_POLL_S)
+        if _filled():
+            return True
+
+    # Fresh price: live tick first, 1-min candle close as fallback.
+    fresh = _get_latest_tick_ltp(client, security_id, exchange_segment, instrument_type)
+    if not fresh:
+        try:
+            df = client.fetch_candles(str(security_id), exchange_segment=exchange_segment,
+                                      instrument_type=instrument_type, days_back=1, resample_tf="1min")
+            fresh = float(df.iloc[-1]["close"]) if not df.empty else None
+        except Exception:
+            fresh = None
+    if not fresh or fresh <= original_limit:
+        # No price, or the market came back to our limit (the resting order is
+        # already marketable): do not touch the order.
+        return False
+
+    chase_cap = round(round(original_limit * (1.0 + MAX_ENTRY_CHASE_PCT) / 0.05) * 0.05, 2)
+    if fresh > chase_cap:
+        return False   # gap already beyond the slippage cap: never chase a runaway
+    new_limit = round(round(min(fresh * 1.005, chase_cap) / 0.05) * 0.05, 2)
+    if new_limit <= original_limit:
+        return False
+
+    try:
+        res = client.dhan.modify_order(
+            order_id=trade_record["order_id"],
+            order_type=client.dhan.LIMIT,
+            leg_name="NA",
+            quantity=int(trade_record["quantity"]),
+            price=new_limit,
+            trigger_price=0,
+            disclosed_quantity=0,
+            validity="DAY",
+        )
+        if not isinstance(res, dict) or res.get("status") != "success":
+            return False
+    except Exception as e:
+        logger.warning(f"Entry chase modify failed for order {trade_record.get('order_id')}: {e}")
+        return False
+    print(f"\U0001F501 [ENTRY CHASE] {trade_record.get('symbol')} unfilled at \u20B9{original_limit}; re-priced once to \u20B9{new_limit} (slippage cap \u20B9{chase_cap}).")
+
+    # Window 2: one more settle window for the re-priced order.
+    for _ in range(ENTRY_SETTLE_TRIES):
+        time.sleep(ENTRY_SETTLE_POLL_S)
+        if _filled():
+            return True
+
+    # Anti-race: if the order actually traded in the last instant, treat it as
+    # filled so the caller places the protective SL instead of aborting.
+    try:
+        st = client.dhan.get_order_by_id(trade_record.get("order_id"))
+        d = st.get("data") if isinstance(st, dict) else None
+        if isinstance(d, list) and d:
+            d = d[0]
+        if (d if isinstance(d, dict) else {}).get("orderStatus") == "TRADED":
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _today_entries(journal: list, setup: str = None, direction: str = None, security_id=None) -> list:
     """P9: today's closed journal entries, optionally filtered by setup/direction/security.
     direction matches EITHER instrument direction OR underlying_direction (options carry both)."""
@@ -2213,6 +2299,15 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
                         print(f"⚠️ Option order rejected by Dhan: {res}")
                         return
                     trade_record["order_id"] = res.get("data", {}).get("orderId")
+                    # 2026-11-20: one-shot re-price chase. If the option gapped away from
+                    # the limit inside the first settle window, re-price ONCE to the fresh
+                    # LTP (capped at +1.5% slippage); beyond the cap, or still unfilled,
+                    # the fail-closed abort below runs exactly as before.
+                    if not _chase_unfilled_entry(client, trade_record, str(opt["security_id"]),
+                                                 "NSE_FNO", "OPTIDX", float(limit_price)):
+                        _abort_unfilled_entry(client, trade_record)
+                        save_state(state)
+                        return
                     # P2: fill-confirmed protective SL (no naked SL, no over-hedged partial fills)
                     sl = client.place_protective_sl_order(
                         security_id=opt["security_id"],
