@@ -353,7 +353,7 @@ def release_engine_lock(fd: Optional[int]) -> None:
 
 
 
-def load_state() -> Dict:
+def load_state(*, read_only: bool = False) -> Dict:
     default_state = {
         "status": "AWAITING_FUNDING",  # AWAITING_FUNDING -> ALIVE -> DEAD_COMA
         "mortality_armed": False,
@@ -381,7 +381,8 @@ def load_state() -> Dict:
         "death_timestamp": None,
         "death_reason": None,
     }
-    lock_fd = _acquire_state_lock(timeout=5.0)
+    # Readers can use the snapshot published by the atomic state-file replace.
+    lock_fd = None if read_only else _acquire_state_lock(timeout=5.0)
     try:
         if os.path.exists(STATE_FILE):
             try:
@@ -391,7 +392,8 @@ def load_state() -> Dict:
             except Exception as e:
                 logger.error(f"Failed to read state file: {e}")
     finally:
-        _release_state_lock(lock_fd)
+        if lock_fd is not None:
+            _release_state_lock(lock_fd)
     return default_state
 
 
@@ -439,17 +441,28 @@ def append_journal(entry: Dict) -> None:
 # ─── Dhan Pro Trader API Client ────────────────────────────────────────────
 
 class SurvivorDhanClient:
-    def __init__(self, *, allow_token_renewal: bool = True):
+    def __init__(
+        self, *, allow_token_renewal: bool = True, allow_order_writes: Optional[bool] = None
+    ):
         load_env_file()
+        self._allow_order_writes = allow_token_renewal if allow_order_writes is None else allow_order_writes
         self.tm = DhanTokenManager(allow_renewal=allow_token_renewal)
         self._connect()
 
     def _connect(self):
         from dhanhq import dhanhq
-        self.dhan = ReadOnlyBroker(dhanhq(self.tm.get_dhan_context()))
+        self.dhan = ReadOnlyBroker(
+            dhanhq(self.tm.get_dhan_context()), allow_writes=self._allow_order_writes
+        )
 
     def reconnect_with_fresh_token(self):
-        """Force a fresh JWT generation (required when IP whitelist is updated mid-day)."""
+        """Reconnect using the token policy selected at construction."""
+        allow_renewal = self.tm.allow_renewal
+        if not allow_renewal:
+            self.tm = DhanTokenManager(allow_renewal=False)
+            self._connect()
+            return
+
         from dhan_broker import TOKEN_STATE_FILE
         # Use a lock file to prevent multiple processes racing to renew simultaneously
         lock_file = TOKEN_STATE_FILE + ".lock"
@@ -471,7 +484,7 @@ class SurvivorDhanClient:
         try:
             if os.path.exists(TOKEN_STATE_FILE):
                 os.remove(TOKEN_STATE_FILE)
-            self.tm = DhanTokenManager()
+            self.tm = DhanTokenManager(allow_renewal=allow_renewal)
             self._connect()
             # Log current public IP for debugging IP whitelist issues
             try:
@@ -507,7 +520,8 @@ class SurvivorDhanClient:
         except Exception as e:
             return {"ordersAllowed": False, "error": str(e)}
 
-        if ip_info.get("ordersAllowed") is True or not allow_update or not live_trading_enabled():
+        if (ip_info.get("ordersAllowed") is True or not allow_update
+                or not self.tm.allow_renewal or not live_trading_enabled()):
             return ip_info
 
         detected_ip = ip_info.get("detectedIP") or _req.get("https://api.ipify.org", timeout=5).text.strip()
@@ -1531,38 +1545,24 @@ def trigger_permanent_coma(client: SurvivorDhanClient, state: Dict, net_equity: 
 # ─── Main Execution Modes ──────────────────────────────────────────────────
 
 def cmd_status(live_Orders: bool = False) -> None:
-    state = load_state()
+    state = load_state(read_only=True)
     if state["status"] == "DEAD_COMA":
         print("🪦 SURVIVOR BOT IS IN PERMANENT COMA (DEAD_COMA).")
         print(f"Died at: {state.get('death_timestamp')} | Reason: {state.get('death_reason')}")
         return
 
-    client = SurvivorDhanClient()
+    try:
+        client = SurvivorDhanClient(allow_token_renewal=False, allow_order_writes=False)
+    except CachedTokenUnavailable as exc:
+        print(f"🚨 STATUS UNAVAILABLE — {exc}")
+        return
     net_liq, avail, utilized, open_pos = client.get_live_equity_and_positions()
 
-    # Check if funding has arrived to auto-arm mortality
-    if not state["mortality_armed"] and net_liq >= ARMING_THRESHOLD:
-        state["mortality_armed"] = True
-        state["status"] = "ALIVE"
-        state["peak_equity"] = max(state["peak_equity"], net_liq)
-        logger.info(f"⚡ Funding detected (₹{net_liq:,.2f})! Mortality check ARMED (Death Floor: ₹{DEATH_FLOOR:,.2f}).")
-
-    state["current_equity"] = net_liq
-    state["available_cash"] = avail
-    if state["mortality_armed"]:
-        state["peak_equity"] = max(state["peak_equity"], net_liq)
-
-    # Check Death Floor if armed
     if state["mortality_armed"] and net_liq <= DEATH_FLOOR:
-        obituary = trigger_permanent_coma(
-            client, state, net_liq,
-            f"Net Liquidation Value (₹{net_liq:,.2f}) fell below the 89% drawdown floor (₹{DEATH_FLOOR:,.2f})."
-        )
-        print(obituary)
+        print(f"⚠️ Death floor breached: equity ₹{net_liq:,.2f} (floor ₹{DEATH_FLOOR:,.2f}).")
         return
 
     tier_info = get_survival_tier(net_liq if state["mortality_armed"] else SEED_CAPITAL)
-    save_state(state)
 
     # Also test live 3-min signal across ALL indices + nearest option candidate per index
     index_scan_lines = []
@@ -2043,9 +2043,13 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
     """
     Single autonomous heartbeat tick (designed to run every 5 min during market hours).
     P5 single-owner engine lock: the WHOLE tick (scan -> entry -> monitor) runs under
-    the engine lock; a concurrent duplicate tick (cron overlap, monitor handoff gap)
-    is skipped, never run in parallel with the owner.
+    the engine lock for live trading. A concurrent live tick is skipped.
     """
+    live = live and live_trading_enabled()
+    if not live:
+        _cmd_tick_inner(live=False, quiet_scan=quiet_scan)
+        return
+
     lock_fd = acquire_engine_lock()
     if lock_fd is None:
         print("⏭️ [ENGINE LOCK] Another tick owns the engine; duplicate tick skipped.")
@@ -2058,19 +2062,24 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
 
 def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
     """
-    Inner tick body (previous cmd_tick logic) — always invoked via cmd_tick()
-    so the single-owner engine lock is enforced.
+    Tick body. cmd_tick holds the engine lock for authorized live trading.
     When `quiet_scan=True` (used by `no_agent=True` zero-token cron jobs), routine idle/scan/cooldown
     ticks produce EMPTY stdout so Telegram is only pinged on actual trade entries, trade exits,
     EOD square-offs, daily target locks, or mortality events!
     """
-    state = load_state()
+    state = load_state(read_only=not live)
+    if not live:
+        state = state.copy()
     if state["status"] == "DEAD_COMA":
         if not quiet_scan:
             print("🪦 SURVIVOR BOT IS IN PERMANENT COMA (DEAD_COMA). No actions taken.")
         return
 
-    client = SurvivorDhanClient()
+    try:
+        client = SurvivorDhanClient(allow_token_renewal=live, allow_order_writes=live)
+    except CachedTokenUnavailable as exc:
+        print(f"🚨 TICK UNAVAILABLE — {exc}")
+        return
     net_liq, avail, utilized, open_pos = client.get_live_equity_and_positions()
 
     now_ist = datetime.now(IST)
@@ -2089,7 +2098,7 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
         state["last_sl_time"] = None
 
     # Auto-arm once funded
-    if not state["mortality_armed"] and net_liq >= ARMING_THRESHOLD:
+    if live and not state["mortality_armed"] and net_liq >= ARMING_THRESHOLD:
         state["mortality_armed"] = True
         state["status"] = "ALIVE"
         state["peak_equity"] = max(state["peak_equity"], net_liq)
@@ -2100,6 +2109,9 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
 
     # 1. HARD MORTALITY CHECK
     if state["mortality_armed"] and net_liq <= DEATH_FLOOR:
+        if not live:
+            print(f"⚠️ Death floor breached: equity ₹{net_liq:,.2f} (floor ₹{DEATH_FLOOR:,.2f}).")
+            return
         obituary = trigger_permanent_coma(
             client, state, net_liq,
             f"Account equity (₹{net_liq:,.2f}) breached the ₹{DEATH_FLOOR:,.2f} (-89%) Death Floor."
@@ -2109,7 +2121,8 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
 
     # If still waiting for ₹30,000 top-up and not forced, report standby status cleanly
     if not state["mortality_armed"]:
-        save_state(state)
+        if live:
+            save_state(state)
         print(f"⏸️ [STANDBY — AWAITING ₹30,000 TOP-UP] Current Dhan Balance: ₹{net_liq:,.2f}. "
               f"Bot will auto-arm as soon as balance reaches ₹{ARMING_THRESHOLD:,.0f}+.")
         return
@@ -2143,24 +2156,19 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
         already_halted = state.get("daily_halted", False)
         state["daily_halted"] = True
         state["daily_halt_reason"] = f"Daily loss limit hit (₹{daily_pnl:,.2f} <= -₹{tier['daily_max_loss_inr']:,.2f})"
-        if open_pos or state.get("active_trade"):
-            if live:
+        if live:
+            if open_pos or state.get("active_trade"):
                 actions = client.emergency_flatten_all()
-                flat = _broker_flat(client)
-            else:
-                actions = ["Dry-run halt flatten"]
-                flat = True
-            # P4: the trade may only be cleared after a VERIFIED flat.
-            if flat:
-                if state.get("active_trade"):
-                    _finalize_closed_trade(client, state, state["active_trade"], "HALT_FLATTENED",
-                                           float(state["active_trade"].get("stop_loss", 0)
-                                                 or state["active_trade"].get("entry_price", 0)))
-                state["active_trade"] = None
-            elif state.get("active_trade"):
-                state["active_trade"]["flatten_pending"] = True
-                print(f"⚠️ Halt flatten INCOMPLETE (position possibly still open; will retry next tick): {actions}")
-        save_state(state)
+                if _broker_flat(client):
+                    if state.get("active_trade"):
+                        _finalize_closed_trade(client, state, state["active_trade"], "HALT_FLATTENED",
+                                               float(state["active_trade"].get("stop_loss", 0)
+                                                     or state["active_trade"].get("entry_price", 0)))
+                    state["active_trade"] = None
+                elif state.get("active_trade"):
+                    state["active_trade"]["flatten_pending"] = True
+                    print(f"⚠️ Halt flatten INCOMPLETE (position possibly still open; will retry next tick): {actions}")
+            save_state(state)
         if not (quiet_scan and already_halted):
             print(f"🛑 Daily survival circuit breaker triggered: {state['daily_halt_reason']}. Resting until tomorrow.")
         return
@@ -2171,26 +2179,28 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
             if live:
                 actions = client.emergency_flatten_all()
                 flat = _broker_flat(client)
+                if flat and state.get("active_trade"):
+                    _finalize_closed_trade(client, state, state["active_trade"], "EOD_SQUARE_OFF", float(state["active_trade"].get("entry_price", 0.0)))
+                    state["active_trade"] = None
+                elif not flat and state.get("active_trade"):
+                    state["active_trade"]["flatten_pending"] = True
+                save_state(state)
+                print(f"🌆 EOD Intraday Square-off executed at {hhmm} IST: {actions}")
             else:
-                actions = ["Dry-run EOD flatten"]
-                flat = True
-            # P4: EOD finalize only after verified flat; otherwise keep retrying next tick.
-            if flat and state.get("active_trade"):
-                _finalize_closed_trade(client, state, state["active_trade"], "EOD_SQUARE_OFF", float(state["active_trade"].get("entry_price", 0.0)))
-                state["active_trade"] = None
-            elif not flat and state.get("active_trade"):
-                state["active_trade"]["flatten_pending"] = True
-            save_state(state)
-            print(f"🌆 EOD Intraday Square-off executed at {hhmm} IST: {actions}")
+                print(f"🌆 Dry tick reached the EOD square-off window at {hhmm} IST.")
         else:
-            save_state(state)
+            if live:
+                save_state(state)
             if not quiet_scan:
                 print(f"🌆 Market closing window ({hhmm} IST). Flat in 100% cash (₹{net_liq:,.2f}).")
         return
 
     # 4. MANAGE EXISTING ACTIVE TRADE VIA 5-SECOND LIVE MONITOR LOOP
     if state.get("active_trade"):
-        monitor_active_trade_loop(client, state, live=live, max_seconds=260, quiet_scan=quiet_scan)
+        if live:
+            monitor_active_trade_loop(client, state, live=True, max_seconds=260, quiet_scan=quiet_scan)
+        elif not quiet_scan:
+            print("Dry tick observed an active trade.")
         return
 
     # 5. SCAN FOR NEW ENTRY (Only between 09:20 and 14:15 IST — no late entries in final 55 mins, max 4 trades/day)
@@ -2203,12 +2213,14 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
             print(f"⛔ Entries blocked: {state.get('entries_blocked_reason')}")
         return
     if not ("09:20" <= hhmm <= "14:15"):
-        save_state(state)
+        if live:
+            save_state(state)
         if not quiet_scan:
             print(f"⏳ Outside active entry window ({hhmm} IST — cutoff 14:15 IST). Equity: ₹{net_liq:,.2f} | Tier: {tier['tier']}")
         return
     if state.get("daily_trades_count", 0) >= 4:
-        save_state(state)
+        if live:
+            save_state(state)
         if not quiet_scan:
             print(f"✅ Max 4 Fast-Strike trades completed today. Protecting capital (₹{net_liq:,.2f}).")
         return
@@ -2265,7 +2277,8 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
         if tier["risk_per_trade_inr"] > max(0.0, remaining_budget):
             if not quiet_scan:
                 print(f"🛡️ [RISK BUDGET] Per-trade risk ₹{tier['risk_per_trade_inr']:,.0f} exceeds remaining daily budget ₹{remaining_budget:,.0f}; no entry.")
-            save_state(state)
+            if live:
+                save_state(state)
             return
         opt = client.get_nearest_nifty_option(
             idx_sig["signal"],
@@ -2289,13 +2302,15 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
                 if len(_same_setup) >= MAX_ENTRIES_PER_SETUP:
                     if not quiet_scan:
                         print(f"🚫 [P9 SETUP BUDGET] {len(_same_setup)} entries already taken today on {_setup} {idx_sig['signal']} — no further chase (max {MAX_ENTRIES_PER_SETUP}).")
-                    save_state(state)
+                    if live:
+                        save_state(state)
                     return
                 _prior_same_sec = _today_entries(_journal, security_id=opt["security_id"], direction=idx_sig["signal"])
                 if _prior_same_sec and float(opt["ltp"]) > float(_prior_same_sec[0]["entry_price"]):
                     if not quiet_scan:
                         print(f"🚫 [P9 RE-ENTRY CAP] {opt['symbol']} LTP ₹{opt['ltp']} > day's first fill ₹{_prior_same_sec[0]['entry_price']} — refusing to pay up for the same signal.")
-                    save_state(state)
+                    if live:
+                        save_state(state)
                     return
                 entry_px = opt["ltp"]
                 qty = opt["lot_size"]
@@ -2379,6 +2394,9 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
                         return
                     trade_record["sl_order_id"] = sl["placed"]
 
+                if not live:
+                    print(f"Dry tick option candidate: {opt['symbol']} × {qty} @ ₹{entry_px}.")
+                    return
                 state["active_trade"] = trade_record
                 state["daily_trades_count"] += 1
                 save_state(state)
@@ -2396,12 +2414,14 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
         if len(_eq_prior) >= MAX_ENTRIES_PER_SETUP:
             if not quiet_scan:
                 print(f"🚫 [P9 SETUP BUDGET] {len(_eq_prior)} entries already taken today on {eq_cand['symbol']} {eq_cand['direction']} — no further chase (max {MAX_ENTRIES_PER_SETUP}).")
-            save_state(state)
+            if live:
+                save_state(state)
             return
         if _eq_prior and float(eq_cand["ltp"]) > float(_eq_prior[0]["entry_price"]):
             if not quiet_scan:
                 print(f"🚫 [P9 RE-ENTRY CAP] {eq_cand['symbol']} LTP ₹{eq_cand['ltp']} > day's first fill ₹{_eq_prior[0]['entry_price']} — refusing to pay up for the same signal.")
-            save_state(state)
+            if live:
+                save_state(state)
             return
         if cooldown_dir == eq_cand["direction"]:
             if not quiet_scan:
@@ -2412,7 +2432,8 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
         if tier["risk_per_trade_inr"] > max(0.0, remaining_budget):
             if not quiet_scan:
                 print(f"🛡️ [RISK BUDGET] Per-trade risk ₹{tier['risk_per_trade_inr']:,.0f} exceeds remaining daily budget ₹{remaining_budget:,.0f}; no equity entry.")
-            save_state(state)
+            if live:
+                save_state(state)
             return
         entry_px = eq_cand["ltp"]
         atr = eq_cand["atr"]
@@ -2490,6 +2511,9 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
                 return
             trade_record["sl_order_id"] = sl["placed"]
 
+        if not live:
+            print(f"Dry tick equity candidate: {eq_cand['symbol']} × {qty} @ ₹{entry_px}.")
+            return
         state["active_trade"] = trade_record
         state["daily_trades_count"] += 1
         save_state(state)
@@ -2497,7 +2521,8 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
         monitor_active_trade_loop(client, state, live=live, max_seconds=250, quiet_scan=quiet_scan)
         return
 
-    save_state(state)
+    if live:
+        save_state(state)
     if not quiet_scan:
         print(f"👁️ [SCAN COMPLETE — NO A+ SETUP] Equity: ₹{net_liq:,.2f} | Life: {tier['life_pct']}% | {idx_sig['reason']}")
 
@@ -2512,7 +2537,7 @@ def cmd_reconcile() -> None:
     5. Prints a complete EOD Reconciliation & Audit Report.
     """
     state = load_state()
-    client = SurvivorDhanClient()
+    client = SurvivorDhanClient(allow_token_renewal=False, allow_order_writes=False)
     net_liq, avail, utilized, open_pos = client.get_live_equity_and_positions()
 
     pos_resp = client.dhan.get_positions()
@@ -2692,14 +2717,14 @@ def cmd_premarket() -> None:
 
     SURVIVOR_LIVE_TRADING=1 in the command environment enables token and whitelist repair.
     """
-    state = load_state()
+    allow_repair = live_trading_enabled()
+    state = load_state(read_only=not allow_repair)
     if state["status"] == "DEAD_COMA":
         print("🪦 [PRE-MARKET CHECK] SURVIVOR BOT IS IN PERMANENT COMA (DEAD_COMA).")
         return
 
-    allow_repair = live_trading_enabled()
     try:
-        client = SurvivorDhanClient(allow_token_renewal=allow_repair)
+        client = SurvivorDhanClient(allow_token_renewal=allow_repair, allow_order_writes=False)
     except CachedTokenUnavailable as exc:
         print(f"🚨 PRE-MARKET ACTION REQUIRED — {exc}")
         return
@@ -2742,7 +2767,8 @@ def cmd_premarket() -> None:
         state["last_sl_time"] = None
     state["current_equity"] = net_liq
     state["available_cash"] = avail
-    save_state(state)
+    if allow_repair:
+        save_state(state)
 
     # 5. Multi-Index Data API & Non-0DTE Expiry Check (with Security Master fallback when pre-9:15 optionchain is 502)
     idx_checks = []

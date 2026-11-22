@@ -88,7 +88,7 @@ class DhanTokenManager:
             return self.access_token
 
         if not self.allow_renewal:
-            raise CachedTokenUnavailable("No valid cached Dhan token for the read-only premarket check.")
+            raise CachedTokenUnavailable("No valid cached Dhan token for this read-only connection.")
         return self._renew_token()
 
     def _renew_token(self) -> str:

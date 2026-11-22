@@ -11,7 +11,7 @@ r=requests.get('https://api.ipify.org',timeout=15); r.raise_for_status()
 print('Current outbound IPv4 (not guaranteed static):',r.text.strip())
 if a.broker:
     import survivor_engine as s
-    c=s.SurvivorDhanClient()
+    c=s.SurvivorDhanClient(allow_token_renewal=False, allow_order_writes=False)
     h={'access-token':c.tm.get_token(),'client-id':c.tm.client_id}
     r=requests.get('https://api.dhan.co/v2/ip/getIP',headers=h,timeout=15);r.raise_for_status()
     print('Dhan whitelist:',json.dumps(r.json()))
