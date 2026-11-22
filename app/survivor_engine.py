@@ -89,6 +89,16 @@ INDEX_UNIVERSE = {
     "Nifty Midcap Select":{"security_id": "442", "lot_size": 120, "symbol_prefix": "MIDCPNIFTY"},
 }
 
+# ─── Live-Entry Pruning (2026-11-22 replay verdict; user-approved option 2) ──
+# Entries-only kill list from the 60-day signal replay (2026-08-26..2026-11-20,
+# gross of costs): SUPERTREND_FLIP -0.33R over 37 first-per-day trades; the
+# "Nifty 50" index -0.33R over 91. BankNifty, Midcap Select, FinNifty,
+# Nifty Next 50 and every other setup stay live. Scope: the live entry scan in
+# _cmd_tick_inner only — open positions, monitoring, the 15:10 flatten and
+# EOD reconcile are unaffected. Re-enable an entry = remove it from the set.
+DISABLED_SETUPS = {"SUPERTREND_FLIP"}
+DISABLED_INDICES = {"Nifty 50"}
+
 # Curated high-liquidity NSE Equities with verified Dhan numeric security IDs
 LIQUID_EQUITY_UNIVERSE = {
     "RELIANCE":   "2885",
@@ -2219,11 +2229,21 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
     best_idx_cfg = None
     best_idx_name = None
     for name, cfg in INDEX_UNIVERSE.items():
+        if name in DISABLED_INDICES:
+            # Live-entry prune (replay 2026-11-22): disabled index has no edge gross of costs.
+            if not quiet_scan:
+                print(f"⏭️ [ENTRY PRUNE] {name}: live entries disabled (replay: no edge); skipping index scan.")
+            continue
         try:
             sid = cfg["security_id"]
             df = client.fetch_candles(sid, exchange_segment="IDX_I", instrument_type="INDEX", days_back=5, resample_tf="3min")
             sig = evaluate_index_signal(df)
             if sig.get("signal") in ("LONG", "SHORT"):
+                if sig.get("setup") in DISABLED_SETUPS:
+                    # Live-entry prune (replay 2026-11-22): disabled setup has no edge gross of costs.
+                    if not quiet_scan:
+                        print(f"⏭️ [ENTRY PRUNE] {name}: {sig.get('setup')} live entries disabled (replay: no edge); skipping signal.")
+                    continue
                 if best_idx_sig is None or sig.get("confidence", 0.0) > best_idx_sig.get("confidence", 0.0):
                     best_idx_sig = sig
                     best_idx_cfg = cfg

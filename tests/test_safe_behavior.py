@@ -642,6 +642,97 @@ class SafeBehaviorRegression(unittest.TestCase):
         self.assertEqual(self.mock.writes(), [],
                          "3rd equity entry on the same security/direction must be blocked")
 
+    # ═══ Live-entry pruning (replay 2026-11-22): disabled setups / indices ═══
+
+    INDEX_SIDS = {"Nifty 50": "13", "Nifty Bank": "25", "FinNifty": "27",
+                  "Nifty Next 50": "38", "Nifty Midcap Select": "442"}
+
+    def enable_index_signals(self, per_index):
+        """Give exactly the named indices a signal; every other index gets no
+        candles (scan error -> skipped). evaluate_index_signal is patched to
+        decode which index a df belongs to from its constant close price."""
+        self.mock.expiry_resp = {"status": "success", "data": {"data": ["2026-10-29"]}}
+        self.mock.option_chain_resp = real_option_chain()
+        se.verify_option_chart_momentum = lambda client, sid: (True, "mock momentum")
+        token = {name: 1000.0 + i for i, name in enumerate(self.INDEX_SIDS)}
+        by_token = {}
+        for name, sig in per_index.items():
+            t = token[name]
+            self.mock.candles[self.INDEX_SIDS[name]] = bars(60, t, 1000)
+            by_token[t] = sig
+        def fake_eval(df):
+            if df is None or len(df) == 0:
+                return {"signal": "NONE", "setup": "NONE", "confidence": 0.0, "reason": "no data"}
+            c = round(float(df["close"].iloc[-1]), 2)
+            return by_token.get(c, {"signal": "NONE", "setup": "NONE",
+                                    "confidence": 0.0, "reason": "no setup"})
+        se.evaluate_index_signal = fake_eval
+
+    def spy_option_index(self):
+        """Record which index the entry scan picked, via the option-lookup kwargs."""
+        recorded = {}
+        orig = RealClient.get_nearest_nifty_option
+        def spy(client_self, *a, **kw):
+            recorded["index_name"] = kw.get("index_name")
+            recorded["under_security_id"] = kw.get("under_security_id")
+            return orig(client_self, *a, **kw)
+        RealClient.get_nearest_nifty_option = spy
+        self.addCleanup(setattr, RealClient, "get_nearest_nifty_option", orig)
+        return recorded
+
+    def test_prune_flags_exclude_exactly_the_replay_losers(self):
+        self.assertEqual(se.DISABLED_SETUPS, {"SUPERTREND_FLIP"})
+        self.assertEqual(se.DISABLED_INDICES, {"Nifty 50"})
+
+    def test_prune_supertrend_flip_signal_skipped(self):
+        sig = {"signal": "LONG", "setup": "SUPERTREND_FLIP", "confidence": 99.0, "reason": "flip"}
+        self.enable_index_signals({n: dict(sig) for n in self.INDEX_SIDS})
+        self.run_cmd_tick()
+        self.assertEqual(self.mock.writes(), [], "SUPERTREND_FLIP must never reach the broker")
+        self.assertEqual(journal(), [])
+        st = json.load(open(se.STATE_FILE))
+        self.assertIsNone(st["active_trade"])
+        self.assertEqual(st["daily_trades_count"], 0)
+
+    def test_prune_nifty50_signal_skipped(self):
+        sig = {"signal": "LONG", "setup": "FAST_STRIKE_TREND", "confidence": 99.0, "reason": "trend"}
+        self.enable_index_signals({"Nifty 50": sig})
+        self.run_cmd_tick()
+        self.assertEqual(self.mock.writes(), [], "Nifty 50 live entries must be pruned")
+        self.assertEqual(journal(), [])
+
+    def test_prune_banknifty_midcap_still_enter(self):
+        bank = {"signal": "LONG", "setup": "FAST_STRIKE_TREND", "confidence": 90.0, "reason": "trend"}
+        mid = {"signal": "LONG", "setup": "ORB_IGNITE", "confidence": 70.0, "reason": "orb"}
+        seen = self.spy_option_index()
+        self.enable_index_signals({"Nifty Bank": bank, "Nifty Midcap Select": mid})
+        self.run_cmd_tick()
+        self.assertEqual(len(self.mock.placed("LIMIT")), 1, "BankNifty/Midcap entries must still fire")
+        self.assertEqual(seen.get("index_name"), "BANKNIFTY",
+                         "highest-confidence ENABLED index must win the entry")
+        self.assertEqual(seen.get("under_security_id"), 25)
+
+    def test_prune_disabled_signal_does_not_shadow_enabled_one(self):
+        n50 = {"signal": "LONG", "setup": "SUPERTREND_FLIP", "confidence": 99.0, "reason": "flip"}
+        mid = {"signal": "LONG", "setup": "SUPERTREND_FLIP", "confidence": 85.0, "reason": "flip"}
+        bank = {"signal": "LONG", "setup": "FAST_STRIKE_TREND", "confidence": 70.0, "reason": "trend"}
+        seen = self.spy_option_index()
+        self.enable_index_signals({"Nifty 50": n50, "Nifty Midcap Select": mid, "Nifty Bank": bank})
+        self.run_cmd_tick()
+        self.assertEqual(len(self.mock.placed("LIMIT")), 1,
+                         "a disabled signal must not block a lower-confidence enabled entry")
+        self.assertEqual(seen.get("index_name"), "BANKNIFTY")
+
+    def test_prune_niftynxt50_not_caught_by_nifty_rule(self):
+        nxt = {"signal": "LONG", "setup": "FAST_STRIKE_TREND", "confidence": 80.0, "reason": "trend"}
+        seen = self.spy_option_index()
+        self.enable_index_signals({"Nifty Next 50": nxt})
+        self.run_cmd_tick()
+        self.assertEqual(len(self.mock.placed("LIMIT")), 1,
+                         "Nifty Next 50 (NIFTYNXT50) must not match the 'Nifty 50' prune rule")
+        self.assertEqual(seen.get("index_name"), "NIFTYNXT50")
+        self.assertEqual(seen.get("under_security_id"), 38)
+
     # ═══ Guard integrity (unchanged staging safeguard) ═══
     def test_z_guard_blocks_all_broker_writes(self):
         m = MockDhan()
