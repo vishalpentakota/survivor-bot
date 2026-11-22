@@ -5,12 +5,12 @@ order placement, position management, and market data.
 """
 
 import os
-import sys
 import json
 import time
 import logging
+import tempfile
 from datetime import datetime, timedelta
-from pathlib import Path
+from cloud_guard import READ_ONLY, RolePolicy
 
 logger = logging.getLogger("dhan_broker")
 
@@ -39,7 +39,7 @@ class DhanTokenManager:
     """
 
     def __init__(self, client_id: str = "", pin: str = "", totp: str = "",
-                 app_id: str = "", app_secret: str = "", *, allow_renewal: bool = True):
+                 app_id: str = "", app_secret: str = "", *, policy: RolePolicy = READ_ONLY):
         # Read from os.environ at runtime (not import-time constants)
         # so that load_env_file() works correctly before token generation.
         self.client_id = client_id or os.environ.get("DHAN_CLIENT_ID", DHAN_CLIENT_ID)
@@ -47,15 +47,21 @@ class DhanTokenManager:
         self.totp = totp or os.environ.get("DHAN_TOTP", DHAN_TOTP)
         self.app_id = app_id or os.environ.get("DHAN_APP_ID", DHAN_APP_ID)
         self.app_secret = app_secret or os.environ.get("DHAN_APP_SECRET", DHAN_APP_SECRET)
-        self.allow_renewal = allow_renewal
+        self._policy = policy
         self.access_token = None
         self.token_expiry = None
 
         # Try to load cached token
         self._load_state()
 
+    @property
+    def allow_renewal(self):
+        return self._policy.renew_token
+
     def _load_state(self):
         """Load cached token if still valid."""
+        self.access_token = None
+        self.token_expiry = None
         if os.path.exists(TOKEN_STATE_FILE):
             try:
                 with open(TOKEN_STATE_FILE, 'r') as f:
@@ -72,12 +78,21 @@ class DhanTokenManager:
 
     def _save_state(self):
         """Persist token to disk."""
+        self._require_renewal()
         state = {
             "access_token": self.access_token,
             "expiry": self.token_expiry.isoformat() if self.token_expiry else None,
         }
-        with open(TOKEN_STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=2)
+        directory = os.path.dirname(os.path.abspath(TOKEN_STATE_FILE))
+        with tempfile.NamedTemporaryFile(mode="w", dir=directory, delete=False) as f:
+            temporary_path = f.name
+            try:
+                json.dump(state, f, indent=2)
+                f.close()
+                os.replace(temporary_path, TOKEN_STATE_FILE)
+            finally:
+                if os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
 
     def get_token(self) -> str:
         """
@@ -87,12 +102,41 @@ class DhanTokenManager:
         if self.access_token and self.token_expiry and datetime.now() < self.token_expiry:
             return self.access_token
 
+        return self._refresh_token(force=False)
+
+    def _require_renewal(self):
         if not self.allow_renewal:
             raise CachedTokenUnavailable("No valid cached Dhan token for this read-only connection.")
-        return self._renew_token()
+
+    def renew_token(self) -> str:
+        """Request a fresh token even when the current token is still usable."""
+        return self._refresh_token(force=True)
+
+    def _refresh_token(self, *, force: bool) -> str:
+        self._require_renewal()
+        lock_file = TOKEN_STATE_FILE + ".lock"
+        try:
+            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            time.sleep(3)
+            self._load_state()
+            if self.access_token:
+                return self.access_token
+            raise CachedTokenUnavailable("Token renewal is locked and no usable cached token is available.")
+
+        try:
+            os.close(fd)
+            if not force:
+                self._load_state()
+                if self.access_token:
+                    return self.access_token
+            return self._renew_token()
+        finally:
+            os.unlink(lock_file)
 
     def _renew_token(self) -> str:
         """Generate a new token using PIN + TOTP flow."""
+        self._require_renewal()
         try:
             import requests
             import pyotp
@@ -103,11 +147,6 @@ class DhanTokenManager:
 
                 # Retry up to 3 times across TOTP 30s window boundaries or Dhan 2-min rate-limit cooldowns
                 for attempt in range(3):
-                    # Re-check disk state first in case another process just renewed the token
-                    self._load_state()
-                    if self.access_token and self.token_expiry and datetime.now() < self.token_expiry:
-                        return self.access_token
-
                     # Wait away from the exact 30s TOTP boundary if <2s remaining
                     rem_in_window = 30 - (int(time.time()) % 30)
                     if rem_in_window <= 2:
@@ -410,18 +449,22 @@ class DhanBroker:
         self._last_order_time = time.time()
 
 
-def load_env_file(env_path: str = None):
-    """Load .env file into environment variables."""
+def load_env_file(env_path: str = None, *, exclude=()):
+    """Read .env values and load keys outside exclude into the environment."""
     if env_path is None:
         env_path = os.path.join(os.path.dirname(__file__), ".env")
 
     if not os.path.exists(env_path):
-        return False
+        return {}
 
+    values = {}
     with open(env_path, 'r') as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 key, value = line.split('=', 1)
-                os.environ[key.strip()] = value.strip().strip('"').strip("'")
-    return True
+                values[key.strip()] = value.strip().strip('"').strip("'")
+    for key, value in values.items():
+        if key not in exclude:
+            os.environ[key] = value
+    return values

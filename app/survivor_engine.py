@@ -38,7 +38,7 @@ import pandas as pd
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cloud_guard import ReadOnlyBroker, live_trading_enabled
+from cloud_guard import LIVE_SWITCH, READ_ONLY, ReadOnlyBroker, RolePolicy, live_trading_enabled
 from dhan_broker import CachedTokenUnavailable, DhanTokenManager, load_env_file
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -440,64 +440,41 @@ def append_journal(entry: Dict) -> None:
 
 # ─── Dhan Pro Trader API Client ────────────────────────────────────────────
 
+def _resolve_role(action: str, *, live: bool = False, repair: bool = False) -> RolePolicy:
+    values = load_env_file(exclude=(LIVE_SWITCH,))
+    return RolePolicy.resolve(
+        action, enabled=live_trading_enabled(values.get(LIVE_SWITCH, "")), live=live, repair=repair
+    )
+
+
 class SurvivorDhanClient:
     def __init__(
-        self, *, allow_token_renewal: bool = True, allow_order_writes: Optional[bool] = None
+        self, *, policy: Optional[RolePolicy] = None,
+        allow_token_renewal: bool = False, allow_order_writes: Optional[bool] = None
     ):
-        load_env_file()
-        self._allow_order_writes = allow_token_renewal if allow_order_writes is None else allow_order_writes
-        self.tm = DhanTokenManager(allow_renewal=allow_token_renewal)
-        self._connect()
+        if policy is None:
+            values = load_env_file(exclude=(LIVE_SWITCH,))
+            enabled = live_trading_enabled(values.get(LIVE_SWITCH, ""))
+            policy = RolePolicy(
+                renew_token=enabled and allow_token_renewal,
+                trade=enabled and allow_order_writes is True,
+            )
+        self._policy = policy
+        self._connect(DhanTokenManager(policy=policy))
 
-    def _connect(self):
+    def _connect(self, token_manager: DhanTokenManager):
         from dhanhq import dhanhq
-        self.dhan = ReadOnlyBroker(
-            dhanhq(self.tm.get_dhan_context()), allow_writes=self._allow_order_writes
-        )
+
+        broker = ReadOnlyBroker(dhanhq(token_manager.get_dhan_context()), policy=self._policy)
+        self.tm = token_manager
+        self.dhan = broker
 
     def reconnect_with_fresh_token(self):
-        """Reconnect using the token policy selected at construction."""
-        allow_renewal = self.tm.allow_renewal
-        if not allow_renewal:
-            self.tm = DhanTokenManager(allow_renewal=False)
-            self._connect()
-            return
-
-        from dhan_broker import TOKEN_STATE_FILE
-        # Use a lock file to prevent multiple processes racing to renew simultaneously
-        lock_file = TOKEN_STATE_FILE + ".lock"
-        try:
-            lock_fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(lock_fd)
-        except FileExistsError:
-            # Another process is renewing; wait for it then reload its token
-            time.sleep(3)
-            self.tm._load_state()
-            if self.tm.access_token and self.tm.token_expiry and datetime.now() < self.tm.token_expiry:
-                self._connect()
-                return
-            # Lock holder may have died; proceed anyway
-            try:
-                os.remove(lock_file)
-            except OSError:
-                pass
-        try:
-            if os.path.exists(TOKEN_STATE_FILE):
-                os.remove(TOKEN_STATE_FILE)
-            self.tm = DhanTokenManager(allow_renewal=allow_renewal)
-            self._connect()
-            # Log current public IP for debugging IP whitelist issues
-            try:
-                import requests as _req
-                pub_ip = _req.get("https://api.ipify.org", timeout=5).text
-                logger.info(f"Token regenerated. Current public IP: {pub_ip}")
-            except Exception:
-                pass
-        finally:
-            try:
-                os.remove(lock_file)
-            except OSError:
-                pass
+        """Reconnect using the original role policy."""
+        manager = DhanTokenManager(policy=self._policy)
+        if self._policy.renew_token:
+            manager.renew_token()
+        self._connect(manager)
 
     def ensure_ip_whitelisted(self, *, allow_update: bool = True) -> Dict:
         """
@@ -521,7 +498,7 @@ class SurvivorDhanClient:
             return {"ordersAllowed": False, "error": str(e)}
 
         if (ip_info.get("ordersAllowed") is True or not allow_update
-                or not self.tm.allow_renewal or not live_trading_enabled()):
+                or not self._policy.repair_ip):
             return ip_info
 
         detected_ip = ip_info.get("detectedIP") or _req.get("https://api.ipify.org", timeout=5).text.strip()
@@ -551,25 +528,6 @@ class SurvivorDhanClient:
             return r2.json() if r2.status_code == 200 else ip_info
         except Exception:
             return ip_info
-
-    def place_order_with_ip_retry(self, **order_kwargs) -> dict:
-        """Place an order; if DH-905 Invalid IP hits, auto-heal IP + regenerate token and retry once.
-        Exit-protection paths (verified flatten, protective SL) pass auto_heal_ip=False:
-        an emergency exit must NEVER trigger IP-whitelist mutation."""
-        auto_heal = order_kwargs.pop("auto_heal_ip", True)
-        res = self.dhan.place_order(**order_kwargs)
-        if res.get("status") != "success":
-            err_code = (res.get("remarks") or {}).get("error_code") if isinstance(res.get("remarks"), dict) else ""
-            if err_code == "DH-905" and auto_heal:
-                logger.warning("DH-905 Invalid IP — running ensure_ip_whitelisted() + token renewal and retrying...")
-                self.ensure_ip_whitelisted()
-                res = self.dhan.place_order(**order_kwargs)
-                if res.get("status") != "success":
-                    err2 = (res.get("remarks") or {}).get("error_code", "") if isinstance(res.get("remarks"), dict) else ""
-                    if err2 == "DH-905":
-                        logger.error("DH-905 persists after token renewal. IP is NOT whitelisted on dhanhq.co dashboard. "
-                                       "Action required: log into dhanhq.co → API Settings → add current public IP to whitelist.")
-        return res
 
     def get_live_equity_and_positions(self) -> Tuple[float, float, float, List[Dict]]:
         """
@@ -859,6 +817,8 @@ class SurvivorDhanClient:
         REJECTED/unresolved exits are retried, and persistent failure is reported
         explicitly ('STILL OPEN') instead of being logged as success.
         """
+        if not (self._policy.trade or self._policy.flatten):
+            raise RuntimeError("Emergency flatten requires an authorized trading or flatten role.")
         actions = []
         try:
             orders_resp = self.dhan.get_order_list()
@@ -888,8 +848,7 @@ class SurvivorDhanClient:
             qty = abs(net_qty)
             filled = False
             for attempt in range(max_retries):
-                res = self.place_order_with_ip_retry(
-                    auto_heal_ip=False,   # emergency exits must never mutate the IP whitelist
+                res = self.dhan._place_exit_order(
                     security_id=sec_id,
                     exchange_segment=exch,
                     transaction_type=txn,
@@ -951,8 +910,7 @@ class SurvivorDhanClient:
             else:
                 lim_px = round(round((trig * 1.02) / tick) * tick, 2)
 
-            res = self.place_order_with_ip_retry(
-                auto_heal_ip=False,   # protective SL exits must never mutate the IP whitelist
+            res = self.dhan.place_order(
                 security_id=str(security_id),
                 exchange_segment=exchange_segment,
                 transaction_type=transaction_type,
@@ -1544,7 +1502,7 @@ def trigger_permanent_coma(client: SurvivorDhanClient, state: Dict, net_equity: 
 
 # ─── Main Execution Modes ──────────────────────────────────────────────────
 
-def cmd_status(live_Orders: bool = False) -> None:
+def cmd_status(live_Orders: bool = False, *, policy: Optional[RolePolicy] = None) -> None:
     state = load_state(read_only=True)
     if state["status"] == "DEAD_COMA":
         print("🪦 SURVIVOR BOT IS IN PERMANENT COMA (DEAD_COMA).")
@@ -1552,7 +1510,7 @@ def cmd_status(live_Orders: bool = False) -> None:
         return
 
     try:
-        client = SurvivorDhanClient(allow_token_renewal=False, allow_order_writes=False)
+        client = SurvivorDhanClient(policy=policy)
     except CachedTokenUnavailable as exc:
         print(f"🚨 STATUS UNAVAILABLE — {exc}")
         return
@@ -2039,15 +1997,15 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
             print(f"🛡️ Holding {active['symbol']} | Entry: ₹{active['entry_price']} | SL: ₹{active['stop_loss']} | TP: ₹{active['target_price']} (5s monitor continuing on next tick)")
 
 
-def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
+def cmd_tick(live: bool = False, quiet_scan: bool = False, *, policy: Optional[RolePolicy] = None) -> None:
     """
     Single autonomous heartbeat tick (designed to run every 5 min during market hours).
     P5 single-owner engine lock: the WHOLE tick (scan -> entry -> monitor) runs under
     the engine lock for live trading. A concurrent live tick is skipped.
     """
-    live = live and live_trading_enabled()
-    if not live:
-        _cmd_tick_inner(live=False, quiet_scan=quiet_scan)
+    policy = policy if policy is not None else _resolve_role("tick", live=live)
+    if not policy.trade:
+        _cmd_tick_inner(policy=policy, quiet_scan=quiet_scan)
         return
 
     lock_fd = acquire_engine_lock()
@@ -2055,18 +2013,19 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False) -> None:
         print("⏭️ [ENGINE LOCK] Another tick owns the engine; duplicate tick skipped.")
         return
     try:
-        _cmd_tick_inner(live=live, quiet_scan=quiet_scan)
+        _cmd_tick_inner(policy=policy, quiet_scan=quiet_scan)
     finally:
         release_engine_lock(lock_fd)
 
 
-def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
+def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False) -> None:
     """
     Tick body. cmd_tick holds the engine lock for authorized live trading.
     When `quiet_scan=True` (used by `no_agent=True` zero-token cron jobs), routine idle/scan/cooldown
     ticks produce EMPTY stdout so Telegram is only pinged on actual trade entries, trade exits,
     EOD square-offs, daily target locks, or mortality events!
     """
+    live = policy.trade
     state = load_state(read_only=not live)
     if not live:
         state = state.copy()
@@ -2076,7 +2035,7 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
         return
 
     try:
-        client = SurvivorDhanClient(allow_token_renewal=live, allow_order_writes=live)
+        client = SurvivorDhanClient(policy=policy)
     except CachedTokenUnavailable as exc:
         print(f"🚨 TICK UNAVAILABLE — {exc}")
         return
@@ -2347,7 +2306,7 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
                     raw_ask = opt["ask"] if opt["ask"] > 0 else entry_px
                     entry_tick = 0.05
                     limit_price = round(round(raw_ask / entry_tick) * entry_tick, 2)
-                    res = client.place_order_with_ip_retry(
+                    res = client.dhan.place_order(
                         security_id=opt["security_id"],
                         exchange_segment="NSE_FNO",
                         transaction_type=client.dhan.BUY,
@@ -2475,7 +2434,7 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
         }
 
         if live:
-            res = client.place_order_with_ip_retry(
+            res = client.dhan.place_order(
                 security_id=eq_cand["security_id"],
                 exchange_segment="NSE_EQ",
                 transaction_type=txn,
@@ -2527,7 +2486,7 @@ def _cmd_tick_inner(live: bool = False, quiet_scan: bool = False) -> None:
         print(f"👁️ [SCAN COMPLETE — NO A+ SETUP] Equity: ₹{net_liq:,.2f} | Life: {tier['life_pct']}% | {idx_sig['reason']}")
 
 
-def cmd_reconcile() -> None:
+def cmd_reconcile(*, policy: Optional[RolePolicy] = None) -> None:
     """
     End-of-Day Broker-to-Journal Reconciliation:
     1. Pulls actual closed positions (`get_positions()`), order book (`get_order_list()`), and fund limits from Dhan.
@@ -2537,7 +2496,7 @@ def cmd_reconcile() -> None:
     5. Prints a complete EOD Reconciliation & Audit Report.
     """
     state = load_state()
-    client = SurvivorDhanClient(allow_token_renewal=False, allow_order_writes=False)
+    client = SurvivorDhanClient(policy=policy)
     net_liq, avail, utilized, open_pos = client.get_live_equity_and_positions()
 
     pos_resp = client.dhan.get_positions()
@@ -2706,25 +2665,28 @@ def cmd_reconcile() -> None:
     print("=" * 72)
 
 
-def cmd_premarket() -> None:
+def cmd_premarket(*, policy: Optional[RolePolicy] = None) -> None:
     """
-    Comprehensive Daily Pre-Market Readiness & Self-Healing System Check (runs at 08:55 IST Mon-Fri):
+    Daily pre-market readiness check.
     1. JWT Token Freshness Check: Uses a valid cached token in read-only mode.
     2. Dhan IP Whitelist Verification (`/v2/ip/getIP`): Checks `ordersAllowed`.
     3. Pro Trader Data API & Multi-Index Feed Check: Verifies candle feed + non-0DTE expiry selection across all 5 indices.
     4. Daily State & Guardrail Reset: Resets `daily_date`, `daily_start_equity`, `daily_trades_count = 0`, `daily_halted = False`, and clears stale overnight cooldowns before 09:15 IST.
     5. Broker Position & Order Hygiene: Confirms 0 open positions and 0 orphan pending orders before the bell.
 
-    SURVIVOR_LIVE_TRADING=1 in the command environment enables token and whitelist repair.
+    Repair requires premarket --live --repair and SURVIVOR_LIVE_TRADING=1.
     """
-    allow_repair = live_trading_enabled()
+    policy = policy if policy is not None else _resolve_role("premarket")
+    allow_repair = policy.repair_ip
     state = load_state(read_only=not allow_repair)
+    if not allow_repair:
+        state = state.copy()
     if state["status"] == "DEAD_COMA":
         print("🪦 [PRE-MARKET CHECK] SURVIVOR BOT IS IN PERMANENT COMA (DEAD_COMA).")
         return
 
     try:
-        client = SurvivorDhanClient(allow_token_renewal=allow_repair, allow_order_writes=False)
+        client = SurvivorDhanClient(policy=policy)
     except CachedTokenUnavailable as exc:
         print(f"🚨 PRE-MARKET ACTION REQUIRED — {exc}")
         return
@@ -2733,7 +2695,7 @@ def cmd_premarket() -> None:
 
     # 1. Ensure JWT token will last through the entire market session (until at least 16:30 IST today)
     token_repaired = False
-    if allow_repair and live_trading_enabled() and (
+    if allow_repair and (
         not client.tm.token_expiry
         or (client.tm.token_expiry - datetime.now()).total_seconds() < 8 * 3600
     ):
@@ -2821,22 +2783,26 @@ def cmd_premarket() -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dhan Survivor Autonomous Trading Organism")
     parser.add_argument("action", choices=["status", "premarket", "tick", "reconcile", "flatten", "simulate-coma-test"], help="Action to run")
-    parser.add_argument("--live", action="store_true", help="Place real live orders on Dhan")
+    parser.add_argument("--live", action="store_true", help="Enable the requested live action")
+    parser.add_argument("--repair", action="store_true", help="Permit token and IP repair with premarket --live")
     parser.add_argument("--quiet", action="store_true", help="Silent on idle/no-op scans (for zero-token no_agent=True cron jobs)")
     args = parser.parse_args()
+    if args.repair and args.action != "premarket":
+        parser.error("--repair is only valid for premarket")
+    policy = _resolve_role(args.action, live=args.live, repair=args.repair)
 
     if args.action == "status":
-        cmd_status()
+        cmd_status(policy=policy)
     elif args.action == "premarket":
-        cmd_premarket()
+        cmd_premarket(policy=policy)
     elif args.action == "tick":
-        cmd_tick(live=args.live, quiet_scan=args.quiet)
+        cmd_tick(quiet_scan=args.quiet, policy=policy)
     elif args.action == "reconcile":
-        cmd_reconcile()
+        cmd_reconcile(policy=policy)
     elif args.action == "flatten":
-        if not args.live or not live_trading_enabled():
+        if not policy.flatten:
             parser.error("flatten requires --live and SURVIVOR_LIVE_TRADING=1")
-        c = SurvivorDhanClient()
+        c = SurvivorDhanClient(policy=policy)
         print("Emergency Flatten:", c.emergency_flatten_all())
     elif args.action == "simulate-coma-test":
         # Non-destructive self-test of the coma/obituary logic using a mock state copy
