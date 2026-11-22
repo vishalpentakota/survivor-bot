@@ -38,7 +38,8 @@ import pandas as pd
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dhan_broker import DhanTokenManager, load_env_file
+from cloud_guard import ReadOnlyBroker, live_trading_enabled
+from dhan_broker import CachedTokenUnavailable, DhanTokenManager, load_env_file
 
 IST = timezone(timedelta(hours=5, minutes=30))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -438,18 +439,18 @@ def append_journal(entry: Dict) -> None:
 # ─── Dhan Pro Trader API Client ────────────────────────────────────────────
 
 class SurvivorDhanClient:
-    def __init__(self):
+    def __init__(self, *, allow_token_renewal: bool = True):
         load_env_file()
-        self.tm = DhanTokenManager()
+        self.tm = DhanTokenManager(allow_renewal=allow_token_renewal)
+        self._connect()
+
+    def _connect(self):
         from dhanhq import dhanhq
-        self.dhan = dhanhq(self.tm.get_dhan_context())
-        from cloud_guard import ReadOnlyBroker
-        self.dhan = ReadOnlyBroker(self.dhan)
+        self.dhan = ReadOnlyBroker(dhanhq(self.tm.get_dhan_context()))
 
     def reconnect_with_fresh_token(self):
         """Force a fresh JWT generation (required when IP whitelist is updated mid-day)."""
         from dhan_broker import TOKEN_STATE_FILE
-        from dhanhq import dhanhq
         # Use a lock file to prevent multiple processes racing to renew simultaneously
         lock_file = TOKEN_STATE_FILE + ".lock"
         try:
@@ -460,7 +461,7 @@ class SurvivorDhanClient:
             time.sleep(3)
             self.tm._load_state()
             if self.tm.access_token and self.tm.token_expiry and datetime.now() < self.tm.token_expiry:
-                self.dhan = dhanhq(self.tm.get_dhan_context())
+                self._connect()
                 return
             # Lock holder may have died; proceed anyway
             try:
@@ -471,7 +472,7 @@ class SurvivorDhanClient:
             if os.path.exists(TOKEN_STATE_FILE):
                 os.remove(TOKEN_STATE_FILE)
             self.tm = DhanTokenManager()
-            self.dhan = dhanhq(self.tm.get_dhan_context())
+            self._connect()
             # Log current public IP for debugging IP whitelist issues
             try:
                 import requests as _req
@@ -485,7 +486,7 @@ class SurvivorDhanClient:
             except OSError:
                 pass
 
-    def ensure_ip_whitelisted(self) -> Dict:
+    def ensure_ip_whitelisted(self, *, allow_update: bool = True) -> Dict:
         """
         Verify via `GET /v2/ip/getIP` that the current public IPv4 is matched and `ordersAllowed == True`.
         If the ISP rotated our public IPv4 overnight (`ipMatchStatus == NO_MATCH` or `ordersAllowed == False`),
@@ -506,7 +507,7 @@ class SurvivorDhanClient:
         except Exception as e:
             return {"ordersAllowed": False, "error": str(e)}
 
-        if ip_info.get("ordersAllowed") is True:
+        if ip_info.get("ordersAllowed") is True or not allow_update or not live_trading_enabled():
             return ip_info
 
         detected_ip = ip_info.get("detectedIP") or _req.get("https://api.ipify.org", timeout=5).text.strip()
@@ -2683,30 +2684,40 @@ def cmd_reconcile() -> None:
 def cmd_premarket() -> None:
     """
     Comprehensive Daily Pre-Market Readiness & Self-Healing System Check (runs at 08:55 IST Mon-Fri):
-    1. JWT Token Freshness Check: If token expires within < 8 hours (before 15:30 IST close), forces fresh PIN+TOTP renewal now.
-    2. Public IPv4 & Dhan IP Whitelist Verification (`/v2/ip/getIP`): Verifies `ordersAllowed == True` (and auto-updates slot if eligible).
+    1. JWT Token Freshness Check: Uses a valid cached token in read-only mode.
+    2. Dhan IP Whitelist Verification (`/v2/ip/getIP`): Checks `ordersAllowed`.
     3. Pro Trader Data API & Multi-Index Feed Check: Verifies candle feed + non-0DTE expiry selection across all 5 indices.
     4. Daily State & Guardrail Reset: Resets `daily_date`, `daily_start_equity`, `daily_trades_count = 0`, `daily_halted = False`, and clears stale overnight cooldowns before 09:15 IST.
     5. Broker Position & Order Hygiene: Confirms 0 open positions and 0 orphan pending orders before the bell.
+
+    SURVIVOR_LIVE_TRADING=1 in the command environment enables token and whitelist repair.
     """
     state = load_state()
     if state["status"] == "DEAD_COMA":
         print("🪦 [PRE-MARKET CHECK] SURVIVOR BOT IS IN PERMANENT COMA (DEAD_COMA).")
         return
 
-    client = SurvivorDhanClient()
+    allow_repair = live_trading_enabled()
+    try:
+        client = SurvivorDhanClient(allow_token_renewal=allow_repair)
+    except CachedTokenUnavailable as exc:
+        print(f"🚨 PRE-MARKET ACTION REQUIRED — {exc}")
+        return
     now_ist = datetime.now(IST)
     today_str = now_ist.strftime("%Y-%m-%d")
 
     # 1. Ensure JWT token will last through the entire market session (until at least 16:30 IST today)
     token_repaired = False
-    if not client.tm.token_expiry or (client.tm.token_expiry - datetime.now()).total_seconds() < 8 * 3600:
+    if allow_repair and live_trading_enabled() and (
+        not client.tm.token_expiry
+        or (client.tm.token_expiry - datetime.now()).total_seconds() < 8 * 3600
+    ):
         client.reconnect_with_fresh_token()
         token_repaired = True
     token_exp_str = client.tm.token_expiry.strftime("%Y-%m-%d %H:%M IST") if client.tm.token_expiry else "UNKNOWN"
 
     # 2. Verify IPv4 Whitelist & ordersAllowed
-    ip_info = client.ensure_ip_whitelisted()
+    ip_info = client.ensure_ip_whitelisted(allow_update=allow_repair)
     orders_allowed = bool(ip_info.get("ordersAllowed"))
     ip_match = ip_info.get("ipMatchStatus", "UNKNOWN")
     detected_ip = ip_info.get("detectedIP", "UNKNOWN")
@@ -2797,6 +2808,8 @@ if __name__ == "__main__":
     elif args.action == "reconcile":
         cmd_reconcile()
     elif args.action == "flatten":
+        if not args.live or not live_trading_enabled():
+            parser.error("flatten requires --live and SURVIVOR_LIVE_TRADING=1")
         c = SurvivorDhanClient()
         print("Emergency Flatten:", c.emergency_flatten_all())
     elif args.action == "simulate-coma-test":

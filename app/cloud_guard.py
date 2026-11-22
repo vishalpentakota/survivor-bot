@@ -9,20 +9,20 @@ Rollback: restore cloud_guard.py from /opt/data/Projects/Survivor-bot/survivor-c
 import os
 
 
+def live_trading_enabled() -> bool:
+    return os.environ.get("SURVIVOR_LIVE_TRADING", "") == "1"
+
+
 class ReadOnlyBroker:
     ALLOWED = frozenset({"get_positions", "get_order_list", "get_order_by_id", "get_trade_book", "get_fund_limits", "intraday_minute_data", "historical_daily_data", "expiry_list", "option_chain", "quote_data", "fetch_security_list"})
 
     def __init__(self, broker):
         self._broker = broker
 
-    @staticmethod
-    def _live_trading_enabled() -> bool:
-        return os.environ.get("SURVIVOR_LIVE_TRADING", "") == "1"
-
     def __getattr__(self, name):
         value = getattr(self._broker, name)
         if callable(value) and name not in self.ALLOWED:
-            if self._live_trading_enabled():
+            if live_trading_enabled():
                 return value  # deliberate live-trading activation (approved cutover)
             raise RuntimeError("Migration safety lock: broker method blocked: " + name)
         return value

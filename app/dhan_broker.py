@@ -28,6 +28,10 @@ DHAN_APP_SECRET = os.environ.get("DHAN_APP_SECRET", "")
 TOKEN_STATE_FILE = os.path.join(os.path.dirname(__file__), ".dhan_token_state.json")
 
 
+class CachedTokenUnavailable(RuntimeError):
+    """A read-only connection requires an unexpired cached token."""
+
+
 class DhanTokenManager:
     """
     Manages Dhan access tokens with automatic renewal.
@@ -35,7 +39,7 @@ class DhanTokenManager:
     """
 
     def __init__(self, client_id: str = "", pin: str = "", totp: str = "",
-                 app_id: str = "", app_secret: str = ""):
+                 app_id: str = "", app_secret: str = "", *, allow_renewal: bool = True):
         # Read from os.environ at runtime (not import-time constants)
         # so that load_env_file() works correctly before token generation.
         self.client_id = client_id or os.environ.get("DHAN_CLIENT_ID", DHAN_CLIENT_ID)
@@ -43,6 +47,7 @@ class DhanTokenManager:
         self.totp = totp or os.environ.get("DHAN_TOTP", DHAN_TOTP)
         self.app_id = app_id or os.environ.get("DHAN_APP_ID", DHAN_APP_ID)
         self.app_secret = app_secret or os.environ.get("DHAN_APP_SECRET", DHAN_APP_SECRET)
+        self.allow_renewal = allow_renewal
         self.access_token = None
         self.token_expiry = None
 
@@ -58,9 +63,9 @@ class DhanTokenManager:
                 # Support both camelCase (Dhan API) and snake_case (our format)
                 self.access_token = state.get("access_token") or state.get("accessToken")
                 self.token_expiry = datetime.fromisoformat(state.get("expiry", "2000-01-01"))
-                # If token has less than 1 hour left, consider it expired
-                if datetime.now() >= self.token_expiry - timedelta(hours=1):
-                    logger.info("Cached token near expiry, will renew.")
+                renewal_margin = timedelta(hours=1) if self.allow_renewal else timedelta()
+                if datetime.now() >= self.token_expiry - renewal_margin:
+                    logger.info("Cached token is too close to expiry for this connection.")
                     self.access_token = None
             except (json.JSONDecodeError, ValueError, KeyError):
                 self.access_token = None
@@ -76,12 +81,14 @@ class DhanTokenManager:
 
     def get_token(self) -> str:
         """
-        Get a valid access token. Auto-renews if expired.
+        Get a valid access token. Renew when required and permitted.
         Returns the token string.
         """
         if self.access_token and self.token_expiry and datetime.now() < self.token_expiry:
             return self.access_token
 
+        if not self.allow_renewal:
+            raise CachedTokenUnavailable("No valid cached Dhan token for the read-only premarket check.")
         return self._renew_token()
 
     def _renew_token(self) -> str:
