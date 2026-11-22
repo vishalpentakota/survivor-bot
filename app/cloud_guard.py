@@ -4,7 +4,7 @@ Live-trading activation (cutover, explicit user approval 2026-10-29):
 Set SURVIVOR_LIVE_TRADING=1 (loaded from app/.env) to pass broker WRITE methods
 through to the real Dhan client. Without it, every write method raises and the
 engine can never place, modify, or cancel an order. Reads are always allowed.
-Rollback: restore cloud_guard.py from /opt/data/survivor-cloud-migration-rollback/.
+Rollback: restore cloud_guard.py from /opt/data/Projects/Survivor-bot/survivor-cloud-migration-rollback/.
 """
 import os
 

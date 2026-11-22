@@ -11,7 +11,7 @@ rejection counter. NEVER places/modifies/cancels orders:
 
 Usage: signal_replay.py [--days 45] [--indices NIFTY,BANKNIFTY,...] [--out DIR]
 
-Outputs (in --out, default /opt/data/survivor-replay):
+Outputs (in --out, default /opt/data/Projects/Survivor-bot/survivor-replay):
   signals.csv     one row per fired signal per rule-set (old/new), with outcome
   rejections.csv  per rule-set / index / gate counters
   summary.md      counts, win-rate, R-distribution, old-vs-new diff
@@ -27,7 +27,7 @@ Option outcome model (APPROXIMATE, flagged in every output):
 import argparse, importlib.util, json, os, sys, time, subprocess
 from datetime import datetime, timedelta, date
 
-APP = "/opt/data/survivor-cloud-migration-vnext/app"
+APP = "/opt/data/Projects/Survivor-bot/survivor-cloud-migration-vnext/app"
 sys.path.insert(0, APP)
 os.environ.pop("SURVIVOR_LIVE_TRADING", None)
 
@@ -63,7 +63,7 @@ def _load(name, path):
 def load_engines():
     os.makedirs(SCRATCH, exist_ok=True)
     src = subprocess.check_output(
-        ["git", "-C", "/opt/data/survivor-cloud-migration-vnext", "show",
+        ["git", "-C", "/opt/data/Projects/Survivor-bot/survivor-cloud-migration-vnext", "show",
          f"{OLD_COMMIT}:app/survivor_engine.py"])
     p = os.path.join(SCRATCH, "survivor_engine_old.py")
     open(p, "wb").write(src)
@@ -89,7 +89,7 @@ class _RO:
 def make_ro(new_engine):
     os.environ.pop("SURVIVOR_LIVE_TRADING", None)
     # credentials/token live in the live tree (vnext has none); read-only use of its client class
-    LIVE_APP = "/opt/data/survivor-cloud-migration/app"
+    LIVE_APP = "/opt/data/Projects/Survivor-bot/survivor-cloud-migration/app"
     saved = list(sys.path)
     sys.path.insert(0, LIVE_APP)
     for m in ("dhan_broker", "cloud_guard"):
@@ -321,7 +321,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=45)
     ap.add_argument("--indices", default="NIFTY,BANKNIFTY,MIDCPNIFTY")
-    ap.add_argument("--out", default="/opt/data/survivor-replay")
+    ap.add_argument("--out", default="/opt/data/Projects/Survivor-bot/survivor-replay")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 

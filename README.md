@@ -1,7 +1,7 @@
 # Survivor migration to Virtuous Plurality — READ-ONLY STAGING
 
 ## Upload instructions for cloud agent
-Extract this ZIP into /opt/data/survivor-cloud-migration (do not overwrite an existing install).
+Extract this ZIP into /opt/data/Projects/Survivor-bot/survivor-cloud-migration (do not overwrite an existing install).
 Read KNOWN_ISSUES.md first. Run `bash install.sh`, then `.venv/bin/python app/cloud_probe.py`.
 Report real outputs. Do not register trading cron jobs, run original engine CLI, change IP whitelist, or place orders.
 The guarded engine blocks its entire CLI; the broker adapter blocks write methods. These are staging safeguards, not an OS sandbox. Supporting modules and original reference are NOT safe live entrypoints.

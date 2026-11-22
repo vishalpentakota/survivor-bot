@@ -13,7 +13,7 @@ Mocked broker only — no network, no real orders, no credentials.
 import sys, os, json, time, types, tempfile, subprocess, threading, unittest
 import logging
 
-APP = "/opt/data/survivor-cloud-migration-vnext/app"
+APP = "/opt/data/Projects/Survivor-bot/survivor-cloud-migration-vnext/app"
 sys.path.insert(0, APP)
 
 # Pre-configure root logging so survivor_engine's import-time basicConfig is a no-op
