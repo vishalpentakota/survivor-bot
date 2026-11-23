@@ -219,7 +219,8 @@ def _recovery_pending(client, active=None) -> bool:
         with exit_lock(EXIT_LEDGER) as ledger:
             _exit_coordinator(client).deliver(ledger)
             cycle = ledger["cycle"]
-            if cycle and (cycle["flatten"] or not active):
+            if ((active and "replay_check" in ledger)
+                    or (cycle and (cycle["flatten"] or not active))):
                 return True
             identity = _trade_identity(active) if active else None
             return identity is not None and any(
@@ -1739,7 +1740,8 @@ def _finalize_closed_trade(client: Optional[SurvivorDhanClient], state: Dict, ac
             matching = [index for index, row in enumerate(journal) if _trade_identity(row) == identity]
             closed = journal[matching[0]] if len(matching) == 1 else None
             proof = _journal_proof(closed) if closed else None
-            replayable = (proof and not ledger["cycle"] and proof["epoch"] == ledger.get("replay_epoch")
+            replayable = (proof and not ledger["cycle"] and "replay_check" not in ledger
+                          and proof["epoch"] == ledger.get("replay_epoch")
                           and _proof_executions(proof) == ledger.get("replay_executions"))
             if not replayable:
                 if replay_only:
@@ -1752,6 +1754,11 @@ def _finalize_closed_trade(client: Optional[SurvivorDhanClient], state: Dict, ac
                 fresh, source = fills
                 if proof and (not fresh or _proof_executions(fresh) != _proof_executions(proof)):
                     return False
+                if "replay_check" in ledger:
+                    saved = ledger.get("replay_executions")
+                    if not fresh or saved and _proof_executions(fresh) != saved:
+                        return False
+                    ledger.pop("replay_check")
                 if fresh:
                     if not ledger.get("replay_epoch"):
                         ledger["replay_epoch"] = uuid4().hex
@@ -1860,6 +1867,11 @@ def _flatten_trade(client, state, active, reason):
             active.setdefault("flatten_reason", reason)
             state["active_trade"] = active
             save_state(state)
+            with exit_lock(EXIT_LEDGER) as ledger:
+                verification_required = "replay_check" in ledger
+            if verification_required:
+                # Recovery of a fenced proof is read-only until fresh agreement.
+                return 0 if _finalize_closed_trade(client, state, active, reason) else 1
         except Exception:
             logger.exception("Exit recovery could not persist state")
             return 1
@@ -2079,7 +2091,14 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
         client = SurvivorDhanClient(policy=policy)
     except CachedTokenUnavailable as exc:
         print(f"🚨 TICK UNAVAILABLE — {exc}")
-        return 1 if live and active and active.get("flatten_pending") else None
+        if live and active:
+            try:
+                with exit_lock(EXIT_LEDGER) as ledger:
+                    if active.get("flatten_pending") or "replay_check" in ledger:
+                        return 1
+            except Exception:
+                return 1
+        return None
     if live and (_recovery_pending(client, active) or active and active.get("flatten_pending")):
         return _flatten_trade(client, state, active, "RESTART_EXIT_RECOVERY")
     if state["status"] == "DEAD_COMA":

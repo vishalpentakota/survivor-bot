@@ -110,7 +110,7 @@ def locked(path):
                 state = json.load(storage)
         except FileNotFoundError:
             state = {"cycle": None, "alerts": {}, "fills": {}, "flat_book": None}
-        if (set(state) - {"replay_epoch", "replay_executions"} != {"cycle", "alerts", "fills", "flat_book"}
+        if (set(state) - {"replay_epoch", "replay_executions", "replay_check"} != {"cycle", "alerts", "fills", "flat_book"}
                 or not isinstance(state["alerts"], dict) or not isinstance(state["fills"], dict)
                 or state["cycle"] is not None and not isinstance(state["cycle"], dict)):
             raise ValueError("Invalid exit ledger")
@@ -600,19 +600,35 @@ class ExitCoordinator:
 
     def closure(self, state, *, settle=True):
         """Read a flat, quiet account and the verified exit IDs under the same lock."""
+        executions = state.get("replay_executions", {})
+        checking = bool(executions) and "replay_check" not in state
+        if checking:
+            # Fence replay before observing the broker. If this write fails,
+            # no observation is made. A crash or later failed write leaves
+            # the fence in place for the next process.
+            state["replay_check"] = "verification_required"
+            self.save(state)
+
         cycle = state["cycle"]
         if cycle and (cycle["flatten"] or not settle):
             return None
         book, exposure = self.snapshot()
-        executions = state.get("replay_executions", {})
-        if (any(exposure.values()) or any(row["orderStatus"] not in TERMINAL for row in book.values())
-                or any(oid in book and execution_evidence(oid, book[oid]) != evidence
-                       for oid, evidence in executions.items())):
-            if executions:
-                state["replay_epoch"] = uuid4().hex
-                del state["replay_executions"]
-                self.save(state)
-            return None
+        if any(exposure.values()):
+            return self._contradicted_closure(state)
+        if any(row["orderStatus"] in WORKING for row in book.values()):
+            return self._contradicted_closure(state)
+        for row in book.values():
+            if row["orderStatus"] not in TERMINAL:
+                raise ValueError("Unverified order status")
+        for oid, evidence in executions.items():
+            if oid in book:
+                listed = execution_evidence(oid, book[oid])
+                detail = self.detail(oid)
+                if (not same_execution(book[oid], detail)
+                        or listed != execution_evidence(oid, detail)):
+                    return None
+                if listed != evidence:
+                    return self._contradicted_closure(state)
         if cycle:
             if not cycle["pending"] or not self.settle(state, cycle, book, exposure):
                 return None
@@ -621,11 +637,35 @@ class ExitCoordinator:
             self.save(state)
         else:
             grouped = defaultdict(dict)
+            baseline = state["flat_book"] or {}
             for oid, row in book.items():
+                if oid in baseline and fill(row) != baseline[oid]:
+                    if same_execution(row, self.detail(oid)):
+                        return self._contradicted_closure(state)
+                    return None
                 grouped[instrument(row)][oid] = row
-            if any(self.execution_net(state, {}, key, rows)[0] for key, rows in grouped.items()):
+            for key, rows in grouped.items():
+                if self.execution_net(state, {}, key, rows)[0]:
+                    return self._contradicted_closure(state)
+        if executions.keys() - book.keys():
+            return None
+        if executions:
+            fresh_book, fresh_exposure = self.snapshot()
+            if (any(fresh_exposure.values())
+                    or any(row["orderStatus"] in WORKING for row in fresh_book.values())):
+                return self._contradicted_closure(state)
+            if fresh_book != book:
                 return None
+        if checking:
+            del state["replay_check"]
+            self.save(state)
         return book, state["fills"]
+
+    def _contradicted_closure(self, state):
+        if state.get("replay_executions") and state.get("replay_check") != "contradicted":
+            state["replay_check"] = "contradicted"
+            self.save(state)
+        return None
 
     def enter(self, params):
         with locked(self.path) as state:
