@@ -1870,8 +1870,19 @@ def _flatten_trade(client, state, active, reason):
             with exit_lock(EXIT_LEDGER) as ledger:
                 verification_required = "replay_check" in ledger
             if verification_required:
-                # Recovery of a fenced proof is read-only until fresh agreement.
-                return 0 if _finalize_closed_trade(client, state, active, reason) else 1
+                if _finalize_closed_trade(client, state, active, reason):
+                    return 0
+                # Keep this trade pending while the coordinator checks other instruments.
+                with exit_lock(EXIT_LEDGER) as ledger:
+                    identity = _trade_identity(active)
+                    matches = [row for row in _read_exit_journal() if _trade_identity(row) == identity]
+                    proof = _journal_proof(matches[0]) if len(matches) == 1 else None
+                    scoped = (ledger.get("replay_check") == "contradicted" and proof
+                              and proof["epoch"] == ledger.get("replay_epoch")
+                              and _proof_executions(proof) == ledger.get("replay_executions"))
+                if scoped:
+                    client.emergency_flatten_all()
+                return 1
         except Exception:
             logger.exception("Exit recovery could not persist state")
             return 1

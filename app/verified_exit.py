@@ -165,14 +165,17 @@ class ExitCoordinator:
                 del state["alerts"][alert_id]
                 self.save(state)
 
-    def start(self, state, *, flatten):
+    def start(self, state, *, flatten, replay_fenced=False):
         state["cycle"] = {
             "id": uuid4().hex, "deadline": time.time() + self.deadline,
             "pending": None, "flatten": flatten, "escalated": False, "confirmed": {}, "exposure": {},
         }
         # Persist newer intent before any broker write, even if its acknowledgement is lost.
-        state["replay_epoch"] = state["cycle"]["id"]
-        state.pop("replay_executions", None)
+        if replay_fenced:
+            state["cycle"]["replay_epoch"] = state["replay_epoch"]
+        else:
+            state["replay_epoch"] = state["cycle"]["id"]
+            state.pop("replay_executions", None)
         self.save(state)
         return state["cycle"]
 
@@ -215,10 +218,28 @@ class ExitCoordinator:
             raise ValueError("Order book changed during position read")
         return before, exposure
 
+    def fenced_instruments(self, state, book):
+        executions = state["replay_executions"]
+        if not executions or not executions.keys() <= book.keys():
+            raise ValueError("Replay executions cannot be attributed")
+        fenced = set()
+        for oid, evidence in executions.items():
+            fenced.add(tuple(evidence["instrument"]))
+            fenced.add(instrument(book[oid]))
+            fenced.add(instrument(self.detail(oid)))
+        return fenced
+
     def flatten(self, max_retries):
         with locked(self.path) as state:
+            replay_fenced = "replay_check" in state
+            cycle = state["cycle"]
+            if replay_fenced and (state["replay_check"] != "contradicted"
+                                  or not state.get("replay_executions")
+                                  or not state.get("replay_epoch")
+                                  or cycle and cycle.get("replay_epoch") != state["replay_epoch"]):
+                return FlattenResult("Flatten INCOMPLETE: replay evidence requires verification")
             self.deliver(state)
-            cycle = state["cycle"] or self.start(state, flatten=True)
+            cycle = cycle or self.start(state, flatten=True, replay_fenced=replay_fenced)
             if not cycle["flatten"] and cycle.get("protected"):
                 cycle["deadline"] = time.time() + self.deadline
             cycle["flatten"] = True
@@ -243,6 +264,7 @@ class ExitCoordinator:
                     grouped = defaultdict(dict)
                     for oid, row in book.items():
                         grouped[instrument(row)][oid] = row
+                    fenced = self.fenced_instruments(state, book) if replay_fenced else set()
                     unknown = cycle.get("account_unknown")
                     if unknown:
                         oid = unknown["oid"]
@@ -266,7 +288,7 @@ class ExitCoordinator:
                     changed = False
                     for key in keys:
                         key_id = self.key_id(key)
-                        if key in reserved or (key_id in deferred and key_id not in pending):
+                        if key in fenced or key in reserved or (key_id in deferred and key_id not in pending):
                             continue
                         try:
                             changed = self.advance(state, cycle, key, grouped[key], book, exposure,
@@ -278,15 +300,21 @@ class ExitCoordinator:
                             break
                     if changed:
                         continue
-                    if (not pending and not any(exposure.values()) and
-                            not any(row["orderStatus"] in WORKING for row in book.values()) and
-                            all(value == 0 for value in verified.values()) and
+                    if (not pending and not any(net for key, net in exposure.items() if key not in fenced) and
+                            not any(row["orderStatus"] in WORKING for key, rows in grouped.items()
+                                    if key not in fenced for row in rows.values()) and
+                            all(value == 0 for key, value in verified.items() if key not in fenced) and
                             self.snapshot() == (book, exposure)):
                         if cycle.get("unresolved"):
                             self.escalate(state, message, verified)
-                        state["flat_book"] = (state["flat_book"] or {}) | {oid: fill(row) for oid, row in book.items()}
+                        state["flat_book"] = (state["flat_book"] or {}) | {
+                            oid: fill(row) for key, rows in grouped.items() if key not in fenced
+                            for oid, row in rows.items()
+                        }
                         state["cycle"] = None
                         self.save(state)
+                        if replay_fenced:
+                            return FlattenResult("Flatten INCOMPLETE: disputed trade remains fenced")
                         return FlattenResult("Broker confirmed flat with no outstanding orders", flat=True)
                     time.sleep(self.interval)
             except Exception as exc:
