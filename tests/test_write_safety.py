@@ -61,24 +61,24 @@ class WriteSafetyTests(unittest.TestCase):
         self.renew = stack.enter_context(patch.object(self.token_module.DhanTokenManager,
                                                        "_renew_token", return_value="mock-renewal"))
 
-    def check_reconnect(self, flag, contended, cached=True):
+    def check_reconnect(self, flag, contended, cached=True, *, live=False):
         if flag is not None:
             os.environ[FLAG] = flag
-        client = self.engine.SurvivorDhanClient()
-        sdk = Mock()
-        self.sdk.dhanhq.return_value = sdk
-        if not cached:
-            def expired(manager):
-                manager.access_token = None
-            load_state = patch.object(self.token_module.DhanTokenManager, "_load_state", expired)
-        else:
-            load_state = contextlib.nullcontext()
-        fs = Mock(O_CREAT=os.O_CREAT, O_EXCL=os.O_EXCL, O_WRONLY=os.O_WRONLY)
+        policy = self.engine._resolve_role("tick", live=live)
+        client = self.engine.SurvivorDhanClient(policy=policy)
+        sdk = self.sdk.dhanhq.return_value
+        fs = Mock(O_CREAT=os.O_CREAT, O_EXCL=os.O_EXCL, O_WRONLY=os.O_WRONLY,
+                  environ=os.environ.copy())
         fs.open.side_effect = FileExistsError if contended else None
         fs.open.return_value = 99
         fs.path = Mock()
         fs.path.exists.return_value = True
-        with load_state, patch.object(self.engine, "os", fs), patch.object(self.engine.time, "sleep"):
+        with (patch.object(self.engine, "os", fs),
+              patch.object(self.token_module, "os", fs),
+              patch.object(self.engine.time, "sleep") as sleep):
+            if not cached:
+                self.assert_reconnect_denied(client, fs, sleep)
+                return
             client.reconnect_with_fresh_token()
         self.sdk.dhanhq.assert_called()
         client.dhan.get_positions()
@@ -91,9 +91,32 @@ class WriteSafetyTests(unittest.TestCase):
             except RuntimeError:
                 continue
             allowed.append(method)
-        expected = list(methods) if flag == "1" else []
+        expected = list(methods) if live and flag == "1" else []
         self.assertEqual(allowed, expected)
         self.assertEqual([method for method in methods if getattr(sdk, method).called], expected)
+        for method in expected:
+            getattr(sdk, method).assert_called_once()
+
+    def assert_reconnect_denied(self, client, fs, sleep):
+        manager, broker = client.tm, client.dhan
+        token_state = manager.access_token, manager.token_expiry
+        self.sdk.reset_mock()
+        manager_class = self.token_module.DhanTokenManager
+        with (patch.object(manager_class, "_load_state"),
+              patch.object(manager_class, "_save_state") as save,
+              patch.object(self.token_module, "open", create=True) as cache_open,
+              patch.object(self.token_module, "tempfile") as cache_temp):
+            with self.assertRaises(self.token_module.CachedTokenUnavailable):
+                client.reconnect_with_fresh_token()
+        self.assertIs(client.tm, manager)
+        self.assertIs(client.dhan, broker)
+        self.assertEqual((manager.access_token, manager.token_expiry), token_state)
+        self.renew.assert_not_called()
+        save.assert_not_called()
+        cache_open.assert_not_called()
+        sleep.assert_not_called()
+        for mock in (fs, cache_temp, self.sdk, self.sdk.dhanhq.return_value, self.http):
+            self.assertEqual(mock.mock_calls, [])
 
     def test_fresh_absent(self):
         self.check_reconnect(None, contended=False, cached=False)
@@ -114,7 +137,7 @@ class WriteSafetyTests(unittest.TestCase):
         self.check_reconnect("0", contended=True, cached=False)
 
     def test_authorized_reconnect(self):
-        self.check_reconnect("1", contended=True)
+        self.check_reconnect("1", contended=True, live=True)
 
     def run_flatten(self, flag=None, live=False):
         if flag is not None:
@@ -142,7 +165,7 @@ class WriteSafetyTests(unittest.TestCase):
         self.run_flatten(flag="1", live=True)
         self.sdk.dhanhq.return_value.cancel_order.assert_called_once_with("mock-order")
 
-    def run_premarket(self):
+    def run_premarket(self, *, policy=None):
         sdk = self.sdk.dhanhq.return_value
         sdk.get_fund_limits.return_value = {"status": "success", "data": {}}
         sdk.expiry_list.return_value = {"status": "success", "data": {"data": ["2099-01-01"]}}
@@ -152,7 +175,7 @@ class WriteSafetyTests(unittest.TestCase):
         with (patch.object(self.engine, "load_state", return_value={"status": "ALIVE"}),
               patch.object(self.engine, "save_state"),
               patch.object(self.engine.SurvivorDhanClient, "fetch_candles", return_value=EmptyFeed())):
-            self.engine.cmd_premarket()
+            self.engine.cmd_premarket(policy=policy)
 
     def test_read_only_premarket_checks_without_repair(self):
         with patch.object(self.engine.SurvivorDhanClient, "reconnect_with_fresh_token") as reconnect:
@@ -174,7 +197,8 @@ class WriteSafetyTests(unittest.TestCase):
 
     def test_authorized_premarket_repairs_with_mocks(self):
         os.environ[FLAG] = "1"
+        policy = self.engine._resolve_role("premarket", live=True, repair=True)
         with patch.object(self.engine.SurvivorDhanClient, "reconnect_with_fresh_token") as reconnect:
-            self.run_premarket()
+            self.run_premarket(policy=policy)
         self.http.put.assert_called_once()
         self.assertEqual(reconnect.call_count, 2)
