@@ -28,6 +28,7 @@ import socket
 import argparse
 import logging
 from contextlib import contextmanager
+from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -1693,11 +1694,12 @@ def _entry_chase(client, coordinator, work, pending, oid, book, exposure):
     security = str(trade["security_id"])
     exchange = trade["exchange_segment"]
     instrument_type = trade["instrument_type"]
-    if coordinator.snapshot() != (book, exposure):
-        return False
     fresh = _get_latest_tick_ltp(client, security, exchange, instrument_type)
     tick = trade["tick_size"]
-    cap = round_tick(limit * (1 + MAX_ENTRY_CHASE_PCT), tick, floor=True)
+    cap = round_tick(Decimal(str(limit)) * (1 + Decimal(str(MAX_ENTRY_CHASE_PCT))), tick, floor=True)
+    if coordinator.snapshot() != (book, exposure):
+        # Reconcile the changed order or exposure before attempting an amendment or cancel.
+        return True
     if not fresh or not limit < fresh <= cap:
         return False
     price = min(cap, round_tick(fresh * 1.005, tick))

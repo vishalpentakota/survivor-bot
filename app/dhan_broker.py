@@ -76,12 +76,13 @@ class DhanTokenManager:
             except (json.JSONDecodeError, ValueError, KeyError):
                 self.access_token = None
 
-    def _save_state(self):
+    def _save_state(self, *, replacement=None):
         """Persist token to disk."""
         self._require_renewal()
+        access_token, expiry = replacement if replacement is not None else (self.access_token, self.token_expiry)
         state = {
-            "access_token": self.access_token,
-            "expiry": self.token_expiry.isoformat() if self.token_expiry else None,
+            "access_token": access_token,
+            "expiry": expiry.isoformat() if expiry else None,
         }
         directory = os.path.dirname(os.path.abspath(TOKEN_STATE_FILE))
         with tempfile.NamedTemporaryFile(mode="w", dir=directory, delete=False) as f:
@@ -162,10 +163,11 @@ class DhanTokenManager:
                     token_data = response.json()
 
                     if response.status_code == 200:
-                        self.access_token = token_data.get("accessToken") or token_data.get("access_token")
-                        if self.access_token:
-                            self.token_expiry = datetime.now() + timedelta(hours=23)
-                            self._save_state()
+                        access_token = token_data.get("accessToken") or token_data.get("access_token")
+                        if access_token:
+                            expiry = datetime.now() + timedelta(hours=23)
+                            self._save_state(replacement=(access_token, expiry))
+                            self.access_token, self.token_expiry = access_token, expiry
                             logger.info(f"Token renewed successfully. Expires: {self.token_expiry}")
                             logger.info(f"Account: {token_data.get('dhanClientName', 'N/A')} ({token_data.get('dhanClientId', 'N/A')})")
                             return self.access_token
