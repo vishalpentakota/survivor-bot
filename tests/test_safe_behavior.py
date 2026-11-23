@@ -12,16 +12,23 @@ Mocked broker only — no network, no real orders, no credentials.
 """
 import sys, os, json, time, types, tempfile, subprocess, threading, unittest
 import logging
+from datetime import timedelta
+from decimal import Decimal
+from pathlib import Path
+from unittest.mock import patch
 
-APP = "/opt/data/Projects/Survivor-bot/survivor-cloud-migration-vnext/app"
-sys.path.insert(0, APP)
-
-# Pre-configure root logging so survivor_engine's import-time basicConfig is a no-op
-logging.basicConfig(level=logging.CRITICAL, format="%(message)s")
+APP = Path(__file__).resolve().parents[1] / "app"
+sys.path.insert(0, str(APP))
 
 import pandas as pd
-import survivor_engine as se
-from cloud_guard import ReadOnlyBroker
+with patch("logging.FileHandler", return_value=logging.NullHandler()):
+    import survivor_engine as se
+from cloud_guard import LIVE_SWITCH, READ_ONLY, ReadOnlyBroker, RolePolicy
+
+if Path(se.__file__).resolve() != APP / "survivor_engine.py":
+    raise ImportError(f"Unexpected survivor_engine import: {se.__file__}")
+
+TICK_POLICY = RolePolicy(renew_token=True, trade=True)
 
 REAL_DT = se.datetime
 NOW = {"dt": REAL_DT(2026, 10, 28, 10, 30, 0, tzinfo=se.IST)}   # mutable per-test
@@ -36,14 +43,15 @@ class FixedDatetime(REAL_DT):
         return base if tz is se.IST else base.astimezone(tz)
 
 RealClient = se.SurvivorDhanClient
-TMP = tempfile.mkdtemp(prefix="survivor_regr_")
 
-def redirect_paths():
-    se.BASE_DIR = TMP
-    se.STATE_FILE = os.path.join(TMP, "survivor_state.json")
-    se.JOURNAL_FILE = os.path.join(TMP, "survivor_trades.json")
-    se.OBITUARY_FILE = os.path.join(TMP, "survivor_obituary.md")
-    se._STATE_LOCK_FILE = os.path.join(TMP, ".survivor_state.lock")
+
+def redirect_paths(tmp):
+    se.BASE_DIR = tmp
+    se.EXIT_LEDGER = os.path.join(tmp, "survivor_exits.json")
+    se.STATE_FILE = os.path.join(tmp, "survivor_state.json")
+    se.JOURNAL_FILE = os.path.join(tmp, "survivor_trades.json")
+    se.OBITUARY_FILE = os.path.join(tmp, "survivor_obituary.md")
+    se._STATE_LOCK_FILE = os.path.join(tmp, ".survivor_state.flock")
 
 def bars(n, close, volume):
     t0 = NOW["dt"].timestamp() - n * 60
@@ -94,8 +102,9 @@ class MockDhan:
         self.real_positions = []       # broker truth
         self.positions_resp = None     # verbatim override (dict or Exception)
         self.orders = []               # get_order_list book (for finalize reconciliation)
-        self.status_queue = []         # FIFO statuses served by get_order_by_id
+        self.status_queue = []         # FIFO statuses for new protective and market orders
         self.fills_update_positions = True
+        self.quote_after_stop = False
         self.funds_gate = None         # threading.Event: block inside get_fund_limits
         self.candles, self.expiry_resp, self.option_chain_resp, self.security_master = {}, None, None, None
         self.place_order_result = None
@@ -115,27 +124,29 @@ class MockDhan:
         return {"status": "success", "data": list(self.real_positions)}
     def get_order_list(self):
         self.calls.append(("get_order_list",))
-        return {"status": "success", "data": list(self.orders)}
+        return {"status": "success", "data": [row.copy() for row in self.orders + list(self._by_oid.values())]}
     def get_order_by_id(self, oid):
         self.calls.append(("get_order_by_id", oid))
-        rec = self._by_oid.get(oid)
-        if rec is None:
-            return {"status": "success", "data": {"orderStatus": "PENDING"}}
-        if self.status_queue:
-            rec["orderStatus"] = self.status_queue.pop(0)
-        if rec["orderStatus"] == "TRADED":
-            if rec["filledQty"] == 0:
-                rec["filledQty"] = rec["quantity"]
-                rec["averageTradedPrice"] = self.fill_price
-            if self.fills_update_positions and rec["orderType"] == "MARKET":
-                for p in self.real_positions:
-                    if str(p.get("securityId")) == str(rec["securityId"]):
-                        p["netQty"] = 0
-        return {"status": "success", "data": dict(rec)}
+        row = self._by_oid.get(oid)
+        if row is None:
+            row = next((order for order in self.orders if order["orderId"] == oid), None)
+        return {"status": "success", "data": row.copy() if row else {"orderStatus": "PENDING"}}
+    def quote_data(self, securities):
+        segment, (sid,) = next(iter(securities.items()))
+        candles = self.candles.get(str(sid))
+        has_exposure = any(str(row["securityId"]) == str(sid) and row["netQty"]
+                           for row in self.real_positions)
+        use_candle = candles and has_exposure and (not self.quote_after_stop or self.placed(self.SL))
+        price = candles["data"]["close"][-1] if use_candle else self.fill_price
+        return {"status": "success", "data": {"data": {segment: {str(sid): {
+            "last_price": price, "last_trade_time": NOW["dt"].isoformat(),
+        }}}}}
     def intraday_minute_data(self, security_id=None, **kw):
         return self.candles.get(str(security_id), {"status": "failure", "data": None})
     def expiry_list(self, **kw): return self.expiry_resp or {"status": "failure", "data": None}
-    def option_chain(self, **kw): return self.option_chain_resp or {"status": "failure", "data": None}
+    def option_chain(self, **kw):
+        self.calls.append(("option_chain", kw))
+        return self.option_chain_resp or {"status": "failure", "data": None}
     def fetch_security_list(self, mode="compact"): return self.security_master
     # ── writes (blocked by ReadOnlyBroker in staging; recorded here)
     def place_order(self, **kw):
@@ -143,21 +154,45 @@ class MockDhan:
         if self.place_order_result is not None: return self.place_order_result
         self._oid += 1
         oid = f"ORD-{self._oid}"
-        self._by_oid[oid] = {"orderId": oid, "orderStatus": "PENDING",
-                             "securityId": str(kw.get("security_id")),
-                             "transactionType": kw.get("transaction_type"),
-                             "quantity": kw.get("quantity"), "orderType": kw.get("order_type"),
-                             "averageTradedPrice": 0.0, "filledQty": 0}
-        # simulate the entry fill appearing in the position book when the BUY is placed
-        sid = str(kw.get("security_id"))
-        if kw.get("transaction_type") == "BUY" and sid in self.buy_fill_qty:
-            self.real_positions = [{"securityId": sid, "netQty": int(self.buy_fill_qty[sid]),
-                                    "exchangeSegment": "NSE_FNO", "productType": "INTRADAY",
-                                    "tradingSymbol": "NIFTY-29-OCT-2026-25000-CE"}]
+        sid = str(kw["security_id"])
+        kind = kw["order_type"]
+        quantity = kw["quantity"]
+        filled = 0
+        status = "PENDING"
+        price = self.fill_price
+        if kind == self.LIMIT:
+            filled = self.buy_fill_qty.get(sid, 0)
+            if filled:
+                status = "TRADED" if filled == quantity else "CANCELLED"
+                self.real_positions = [{"securityId": sid, "netQty": filled,
+                                        "exchangeSegment": kw["exchange_segment"],
+                                        "productType": kw["product_type"]}]
+        elif self.status_queue:
+            status = self.status_queue.pop(0)
+            if status == "TRADED":
+                filled = quantity
+                for position in self.real_positions:
+                    if str(position["securityId"]) == sid:
+                        candles = self.candles.get(sid)
+                        if candles:
+                            price = candles["data"]["close"][-1]
+                        if self.fills_update_positions and kind == self.MARKET:
+                            position["netQty"] = 0
+        self._by_oid[oid] = {
+            "orderId": oid, "orderStatus": status, "securityId": sid,
+            "exchangeSegment": kw["exchange_segment"], "productType": kw["product_type"],
+            "transactionType": kw["transaction_type"], "quantity": quantity, "orderType": kind,
+            "averageTradedPrice": price if filled else 0.0, "filledQty": filled,
+            "createTime": (NOW["dt"] + timedelta(seconds=self._oid)).isoformat(),
+            "correlationId": kw["tag"], "price": kw["price"],
+            "triggerPrice": kw.get("trigger_price", 0),
+        }
         return {"status": "success", "data": {"orderId": oid}}
     def cancel_order(self, oid):
         self.calls.append(("cancel_order", oid))
-        if oid in self._by_oid: self._by_oid[oid]["orderStatus"] = "CANCELLED"
+        for row in [*self.orders, *self._by_oid.values()]:
+            if row["orderId"] == oid:
+                row["orderStatus"] = "CANCELLED"
         return {"status": "success"}
     def modify_order(self, **kw): self.calls.append(("modify_order", kw)); return {"status": "success"}
     # ── helpers
@@ -166,9 +201,10 @@ class MockDhan:
         return [w for w in self.writes() if w[0] == "place_order"
                 and (order_type is None or w[1].get("order_type") == order_type)]
 
-def make_client(mock):
+def make_client(mock, *, policy=TICK_POLICY):
     c = object.__new__(RealClient)
-    c.dhan = mock
+    c._policy = policy
+    c.dhan = ReadOnlyBroker(mock, policy=policy)
     c.tm = types.SimpleNamespace(get_token=lambda: "T", client_id="C",
                                  get_dhan_context=lambda: {}, access_token="T", token_expiry=None)
     return c
@@ -178,49 +214,92 @@ def real_option_chain(expiry="2026-10-29", last=25000.0, ltp=100.0):
         "last_price": last,
         "oc": {"25000": {"ce": {
             "last_price": ltp, "top_bid_price": ltp - 1.0, "top_ask_price": ltp + 1.0,
-            "security_id": "99991", "oi": 5000, "volume": 20000,
+            "security_id": "99991", "lot_size": 65, "oi": 5000, "volume": 20000,
             "greeks": {"delta": 0.50, "theta": -5.0}, "implied_volatility": 15.0}}}}}}
 
 class SafeBehaviorRegression(unittest.TestCase):
     def setUp(self):
-        redirect_paths()
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="survivor_regr_"))
+        paths = ("BASE_DIR", "EXIT_LEDGER", "STATE_FILE", "JOURNAL_FILE",
+                 "OBITUARY_FILE", "_STATE_LOCK_FILE")
+        for name in paths:
+            self.addCleanup(setattr, se, name, getattr(se, name))
+        redirect_paths(self.tmp)
+        (Path(self.tmp) / "exchange_calendar.json").write_text(json.dumps({
+            "source": "Regression exchange calendar fixture",
+            "sessions": {day: ["09:15", "15:30"] for day in (TODAY, "2026-10-29")},
+        }))
         NOW["dt"] = REAL_DT(2026, 10, 28, 10, 30, 0, tzinfo=se.IST)
         se.datetime = FixedDatetime
-        for f in (se.STATE_FILE, se.JOURNAL_FILE):
-            if os.path.exists(f): os.unlink(f)
-        if os.path.exists(os.path.join(TMP, ".survivor_engine.lock")):
-            os.unlink(os.path.join(TMP, ".survivor_engine.lock"))
+        self.enterContext(patch.object(se, "send_telegram", return_value=True))
         # speed: collapse the engine's wall-clock waits (patched engine reads these)
         for k, v in [("ENTRY_SETTLE_POLL_S", 0.001), ("ENTRY_SETTLE_TRIES", 3),
-                     ("SL_STATUS_SLEEP", 0.001), ("SL_RETRY_SLEEP", 0.001),
                      ("FLATTEN_POLL_S", 0.001), ("FLATTEN_POLL_N", 3),
-                     ("FINALIZE_SLEEP", 0.001), ("MONITOR_POLL_S", 0.01)]:
-            setattr(se, k, v)
+                     ("MONITOR_POLL_S", 0.01)]:
+            self.enterContext(patch.object(se, k, v))
         # snapshot module globals we may patch per-test
         self._saved = {k: getattr(se, k) for k in
                        ("SurvivorDhanClient", "evaluate_index_signal",
                         "verify_option_chart_momentum", "scan_equity_candidates",
                         "compute_indicators")}
         self.mock = MockDhan()
-        se.SurvivorDhanClient = lambda: make_client(self.mock)
+        self.constructor_policy = threading.local()
+        se.SurvivorDhanClient = self.make_tick_client
         seed_state()
     def tearDown(self):
         for k, v in self._saved.items(): setattr(se, k, v)
         se.datetime = REAL_DT
     # ── helpers
     def enable_long_signal(self):
+        self.mock.candles["25"] = bars(60, 25000.0, 1000)
         se.evaluate_index_signal = lambda df: {"signal": "LONG", "confidence": 99.0,
                                                "reason": "regression setup", "setup": "FAST_STRIKE"}
         se.verify_option_chart_momentum = lambda client, sid: (True, "mock momentum")
         self.mock.expiry_resp = {"status": "success", "data": {"data": ["2026-10-29"]}}
         self.mock.option_chain_resp = real_option_chain()
-    def run_cmd_tick(self, live=True):
-        se.cmd_tick(live=live, quiet_scan=False)
+    def seed_broker_trade(self, trade, *, stop_status=None, exit_price=None):
+        sid = trade["security_id"]
+        segment = trade["exchange_segment"]
+        qty = trade["quantity"]
+        side = "SELL" if trade["weapon"] == "EQUITY" and trade["direction"] == "SHORT" else "BUY"
+        opposite = "BUY" if side == "SELL" else "SELL"
+        entry_time = REAL_DT.fromisoformat(trade["entry_time"])
+        instrument = {"securityId": sid, "exchangeSegment": segment, "productType": "INTRADAY"}
+        self.mock.real_positions = [
+            dict(instrument, netQty=0 if exit_price is not None else qty if side == "BUY" else -qty)
+        ]
+        self.mock.orders = [dict(
+            instrument, orderId=trade["order_id"], orderStatus="TRADED",
+            transactionType=side, orderType="LIMIT", quantity=qty,
+            filledQty=qty, averageTradedPrice=trade["entry_price"],
+            createTime=entry_time.isoformat(),
+        )]
+        if stop_status is not None:
+            prices = se.stop_prices(trade["stop_loss"], 0.05, opposite)
+            self.mock.orders.append(dict(
+                instrument, orderId=trade["sl_order_id"], orderStatus=stop_status,
+                transactionType=opposite, orderType="STOP_LOSS", quantity=qty,
+                filledQty=qty if exit_price is not None else 0,
+                averageTradedPrice=exit_price or 0.0,
+                createTime=(entry_time + timedelta(seconds=1)).isoformat(),
+                price=prices["price"], triggerPrice=prices["trigger_price"],
+            ))
+
+    def make_tick_client(self, *, policy):
+        self.constructor_policy.received.append(policy)
+        self.assertIs(policy, TICK_POLICY, "cmd_tick must forward its trading policy")
+        return make_client(self.mock, policy=policy)
+
+    def run_cmd_tick(self, *, expects_client=True):
+        self.constructor_policy.received = []
+        se.cmd_tick(policy=TICK_POLICY, quiet_scan=False)
+        self.assertEqual(self.constructor_policy.received, [TICK_POLICY] if expects_client else [])
+
 
     # ═══ P1: fail-closed position-status handling ═══
     def test_p1_position_api_failure_does_not_close_trade(self):
         seed_state({"active_trade": active_trade()})
-        self.mock.real_positions = [{"securityId": "99991", "netQty": 65}]
+        self.seed_broker_trade(active_trade())
         self.mock.positions_resp = {"status": "failure", "remarks": {"error_code": "DH-902"}, "data": []}
         c = make_client(self.mock)
         st = se.load_state()
@@ -232,7 +311,7 @@ class SafeBehaviorRegression(unittest.TestCase):
 
     def test_p1_position_api_exception_does_not_close_trade(self):
         seed_state({"active_trade": active_trade()})
-        self.mock.real_positions = [{"securityId": "99991", "netQty": 65}]
+        self.seed_broker_trade(active_trade())
         self.mock.positions_resp = ConnectionError("broker unreachable")
         c = make_client(self.mock)
         st = se.load_state()
@@ -242,7 +321,7 @@ class SafeBehaviorRegression(unittest.TestCase):
 
     def test_p1_genuine_exchange_sl_fill_still_detected(self):
         seed_state({"active_trade": active_trade()})
-        self.mock.real_positions = []   # position genuinely closed by exchange SL
+        self.seed_broker_trade(active_trade(), stop_status="TRADED", exit_price=90.0)
         self.mock.positions_resp = {"status": "success", "data": []}
         c = make_client(self.mock)
         st = se.load_state()
@@ -251,21 +330,33 @@ class SafeBehaviorRegression(unittest.TestCase):
         self.assertEqual(journal()[-1]["exit_reason"], "EXCHANGE_SL_FILLED")
 
     def test_p1_consecutive_failures_block_new_entries(self):
-        seed_state({"active_trade": active_trade()})
+        self.enable_long_signal()
+        trade = active_trade()
+        seed_state({"active_trade": trade})
+        self.seed_broker_trade(trade, stop_status="PENDING")
         self.mock.positions_resp = {"status": "failure", "data": []}
         c = make_client(self.mock)
-        st = se.load_state()
-        for _ in range(3):
-            se.monitor_active_trade_loop(c, st, live=True, max_seconds=0.4, quiet_scan=True)
-        self.assertTrue(st.get("entries_blocked_reason"),
-                        "3 consecutive position-API failures must block new entries")
-        self.assertGreaterEqual(st.get("pos_check_failures", 0), 3)
+        se.monitor_active_trade_loop(c, se.load_state(), live=True, max_seconds=0.4, quiet_scan=True)
+
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                if restart:
+                    self.run_cmd_tick()
+                persisted = se.load_state()["active_trade"]
+                self.assertEqual(persisted["order_id"], trade["order_id"])
+                self.assertTrue(persisted.get("flatten_pending"), "flatten_pending must persist")
+                recovery = json.loads(Path(se.EXIT_LEDGER).read_text())["cycle"]
+                self.assertTrue(recovery["flatten"])
+                self.assertTrue(recovery["unresolved"])
+                self.assertEqual(self.mock.real_positions[0]["netQty"], trade["quantity"])
+                self.assertEqual(journal(), [])
+                self.assertEqual(self.mock.placed("LIMIT"), [])
+                self.assertEqual(self.mock.writes(), [])
 
     # ═══ P2: fill-confirmed entries, timeouts, partial fills ═══
     def test_p2_entry_timeout_cancels_pending_and_aborts(self):
         self.enable_long_signal()
         self.mock.real_positions = []            # entry never fills
-        self.mock.status_queue = ["PENDING"]     # entry order still pending at abort check
         self.run_cmd_tick()
         self.assertEqual(self.mock.placed("STOP_LOSS"), [], "no SL may be placed without a confirmed fill")
         self.assertEqual(len(self.mock.placed("LIMIT")), 1, "entry was submitted")
@@ -277,12 +368,22 @@ class SafeBehaviorRegression(unittest.TestCase):
         self.assertEqual(journal(), [])
 
     def test_p2_partial_fill_sizes_sl_and_journal_to_filled_qty(self):
-        self.enable_long_signal()
-        self.mock.buy_fill_qty = {"99991": 25}      # entry order fills only 25 of 65
-        self.mock.status_queue = ["PENDING"]     # SL order accepted, pending (not rejected)
-        self.mock.candles["99991"] = bars(30, 80.0, 100)   # 1-min LTP 80 <= SL -> immediate exit
-        self.mock.status_queue += ["TRADED"]      # flatten order fills
-        self.run_cmd_tick()
+        # Use the normal entry workflow with two 25-unit lots. The option
+        # scanner submits one lot, so its partial fills cannot be whole lots.
+        trade = active_trade(quantity=50, lot_size=25, tick_size=0.05, expiry="2026-10-29")
+        del trade["order_id"], trade["sl_order_id"]
+        self.mock.buy_fill_qty = {"99991": 25}
+        self.mock.quote_after_stop = True
+        self.mock.status_queue = ["PENDING", "TRADED"]
+        self.mock.candles["99991"] = bars(30, 80.0, 100)
+
+        client = make_client(self.mock)
+        state = se.load_state()
+        outcome = se._start_entry(client, state, trade, "BUY", "LIMIT", 100.0)
+        self.assertEqual(outcome, "ready")
+        entry, = self.mock.placed("LIMIT")
+        self.assertEqual(entry[1]["quantity"], 50)
+        se._entry_tick_result(client, state, outcome, quiet_scan=True)
         sl_orders = self.mock.placed("STOP_LOSS")
         self.assertEqual(len(sl_orders), 1)
         self.assertEqual(sl_orders[0][1]["quantity"], 25, "SL quantity must match the FILLED quantity")
@@ -298,36 +399,71 @@ class SafeBehaviorRegression(unittest.TestCase):
     def test_p3_sl_triple_rejected_flattens_position(self):
         self.enable_long_signal()
         self.mock.buy_fill_qty = {"99991": 65}     # entry fills fully
-        self.mock.status_queue = ["REJECTED", "REJECTED", "REJECTED", "TRADED"]
-        self.run_cmd_tick()
-        self.assertEqual(len(self.mock.placed("STOP_LOSS")), 3, "SL retried 3x")
+        self.mock.status_queue = ["REJECTED", "TRADED"]
+        tick_size = 0.05
+        tick = Decimal(str(tick_size))
+        (Path(self.tmp) / ".tick_size_cache.json").write_text(json.dumps({
+            "NSE_FNO:99991": {"tick_size": tick_size},
+        }))
+        start_entry = se._start_entry
+
+        def start_with_unaligned_stop(client, state, trade, side, order_type, price):
+            self.assertEqual(trade["tick_size"], tick_size)
+            # Exercise protection rounding after the signal path's own rounding.
+            trade = dict(trade, stop_loss=90.073)
+            return start_entry(client, state, trade, side, order_type, price)
+
+        with patch.object(se, "_start_entry", start_with_unaligned_stop):
+            self.run_cmd_tick()
+        (_, submitted_stop), = self.mock.placed("STOP_LOSS")
+        self.assertEqual(Decimal(str(submitted_stop["trigger_price"])) % tick, 0,
+                         "submitted STOP_LOSS trigger must align to the trade tick")
+        self.assertEqual(Decimal(str(submitted_stop["price"])) % tick, 0,
+                         "submitted STOP_LOSS limit must align to the trade tick")
+        stop, = (row for row in self.mock._by_oid.values() if row["orderType"] == "STOP_LOSS")
+        self.assertEqual(stop["orderStatus"], "REJECTED")
+        self.assertEqual(stop["filledQty"], 0)
         self.assertEqual(len(self.mock.placed("MARKET")), 1, "unprotected position must be market-flattened")
         self.assertEqual(self.mock.real_positions[0]["netQty"], 0, "position must be closed (broker truth)")
         st = json.load(open(se.STATE_FILE))
         self.assertIsNone(st["active_trade"])
-        self.assertEqual(journal()[-1]["exit_reason"], "UNPROTECTED_POSITION_FLATTENED")
+        closed, = journal()
+        self.assertEqual(closed["exit_trigger"], "UNPROTECTED_POSITION_EXIT")
+        self.assertTrue(closed["fills_verified"])
+        self.assertEqual(closed["quantity"], 65)
+        exit_fill, = closed["exit_proof"]["exits"]
+        self.assertEqual(exit_fill["side"], "SELL")
+        self.assertEqual(exit_fill["quantity"], 65)
 
     def test_p3_flatten_rejected_then_filled_on_retry(self):
-        self.mock.real_positions = [{"securityId": "99991", "netQty": 65}]
+        self.seed_broker_trade(active_trade())
         self.mock.status_queue = ["REJECTED", "TRADED"]
         c = make_client(self.mock)
         actions = c.emergency_flatten_all()
         self.assertEqual(self.mock.real_positions[0]["netQty"], 0, "retry must close the position")
         self.assertEqual(len(self.mock.placed("MARKET")), 2)
-        self.assertTrue(any("TRADED" in a for a in actions), actions)
+        rejected, filled = self.mock._by_oid.values()
+        self.assertEqual(rejected["orderStatus"], "REJECTED")
+        self.assertEqual(filled["filledQty"], 65)
+        self.assertTrue(actions.flat)
+        self.assertEqual(actions.exit_ids, (filled["orderId"],))
 
     def test_p3_flatten_persistently_rejected_reports_failure(self):
-        self.mock.real_positions = [{"securityId": "99991", "netQty": 65}]
+        self.seed_broker_trade(active_trade())
         self.mock.status_queue = ["REJECTED"] * 9
         c = make_client(self.mock)
         actions = c.emergency_flatten_all()
         self.assertNotEqual(self.mock.real_positions[0]["netQty"], 0, "position must remain open")
-        self.assertTrue(any("STILL OPEN" in a or "FAILED" in a for a in actions), actions)
+        self.assertFalse(actions.flat)
+        self.assertTrue(self.mock.placed("MARKET"), "flatten must attempt a broker exit")
+        self.assertTrue(all(row["orderStatus"] == "REJECTED" for row in self.mock._by_oid.values()))
+        recovery = json.loads(Path(se.EXIT_LEDGER).read_text())["cycle"]
+        self.assertTrue(recovery["unresolved"])
 
     # ═══ P4: halt + verified flatten ═══
     def test_p4_halt_with_verified_flat_clears_trade(self):
         self.mock.funds = {"status": "success", "data": {"availabelBalance": 24000.0, "utilizedAmount": 0.0}}
-        self.mock.real_positions = [{"securityId": "99991", "netQty": 65}]
+        self.seed_broker_trade(active_trade())
         self.mock.status_queue = ["TRADED"]      # flatten fills
         seed_state({"daily_start_equity": 30000.0, "active_trade": active_trade()})
         self.run_cmd_tick()
@@ -338,7 +474,7 @@ class SafeBehaviorRegression(unittest.TestCase):
 
     def test_p4_halt_flatten_failure_retains_trade_as_pending(self):
         self.mock.funds = {"status": "success", "data": {"availabelBalance": 24000.0, "utilizedAmount": 0.0}}
-        self.mock.real_positions = [{"securityId": "99991", "netQty": 65}]
+        self.seed_broker_trade(active_trade())
         self.mock.status_queue = ["REJECTED"] * 9   # flatten persistently rejected
         seed_state({"daily_start_equity": 30000.0, "active_trade": active_trade()})
         self.run_cmd_tick()
@@ -351,9 +487,9 @@ class SafeBehaviorRegression(unittest.TestCase):
 
     def test_p4_flatten_pending_retried_and_completed_next_tick(self):
         self.mock.funds = {"status": "success", "data": {"availabelBalance": 24000.0, "utilizedAmount": 0.0}}
-        self.mock.real_positions = [{"securityId": "99991", "netQty": 65}]
+        self.seed_broker_trade(active_trade())
         seed_state({"daily_start_equity": 30000.0,
-                    "active_trade": active_trade(flatten_pending=True),
+                    "active_trade": active_trade(flatten_pending=True, flatten_reason="HALT_FLATTENED"),
                     "daily_halted": True,
                     "daily_halt_reason": "Daily loss limit hit"})
         self.mock.status_queue = ["TRADED"]      # retry succeeds
@@ -371,7 +507,7 @@ class SafeBehaviorRegression(unittest.TestCase):
             try: self.run_cmd_tick()
             except Exception as e: results["a"] = e
         def tick_b():
-            try: self.run_cmd_tick()
+            try: self.run_cmd_tick(expects_client=False)
             except Exception as e: results["b"] = e
         ta = threading.Thread(target=tick_a); ta.start()
         deadline = time.time() + 5
@@ -389,11 +525,34 @@ class SafeBehaviorRegression(unittest.TestCase):
 
     def test_p5_stale_engine_lock_recovered(self):
         p = subprocess.Popen(["/bin/sleep", "0.05"]); p.wait()   # now-dead pid
-        lock = os.path.join(TMP, ".survivor_engine.lock")
+        lock = os.path.join(self.tmp, ".survivor_engine.lock")
         with open(lock, "w") as f: f.write(str(p.pid))
         self.run_cmd_tick()   # must recover the stale lock and proceed
         self.assertTrue(any(c[0] == "get_fund_limits" for c in self.mock.calls),
                         "stale lock (dead owner) must not block the engine")
+
+        for args, expected_policy in (
+            (("status", "--live"), READ_ONLY),
+            (("tick",), READ_ONLY),
+            (("flatten", "--live"), RolePolicy(renew_token=True, flatten=True)),
+        ):
+            with self.subTest(command=" ".join(args)):
+                received = []
+
+                def construct_client(*, policy):
+                    received.append(policy)
+                    self.assertEqual(policy, expected_policy,
+                                     "command must construct the client with its designated policy")
+                    return make_client(self.mock, policy=policy)
+
+                with (
+                    patch.object(sys, "argv", ["survivor_engine.py", *args]),
+                    patch.dict(os.environ, {LIVE_SWITCH: "1"}),
+                    patch.object(se, "load_env_file", autospec=True, return_value={}),
+                    patch.object(se, "SurvivorDhanClient", construct_client),
+                ):
+                    se.main()
+                self.assertEqual(received, [expected_policy])
 
     # ═══ P6: hard 0DTE ban ═══
     def test_p6_no_sameday_expiry_on_primary_path(self):
@@ -421,11 +580,11 @@ class SafeBehaviorRegression(unittest.TestCase):
                                                "reason": "regression", "setup": "FAST_STRIKE"}
         se.verify_option_chart_momentum = lambda client, sid: (True, "mock")
         # optionchain unavailable -> engine falls back to security-master (synthetic quotes)
-        self.mock.expiry_resp = {"status": "failure", "data": None}
-        self.mock.candles["13"] = bars(60, 25000.0, 1000)
+        self.mock.expiry_resp = {"status": "success", "data": {"data": ["2026-10-29"]}}
+        self.mock.candles["25"] = bars(60, 25000.0, 1000)
         self.mock.candles["99991"] = bars(60, 100.0, 12345)
         self.mock.security_master = pd.DataFrame([{
-            "SEM_INSTRUMENT_NAME": "OPTIDX", "SEM_TRADING_SYMBOL": "NIFTY-29-OCT-2026-25000-CE",
+            "SEM_INSTRUMENT_NAME": "OPTIDX", "SEM_TRADING_SYMBOL": "BANKNIFTY-29-OCT-2026-25000-CE",
             "SEM_OPTION_TYPE": "CE", "SEM_EXPIRY_DATE": "2026-10-29",
             "SEM_SMST_SECURITY_ID": "99991", "SEM_STRIKE_PRICE": 25000.0}])
         self.run_cmd_tick()
@@ -460,22 +619,23 @@ class SafeBehaviorRegression(unittest.TestCase):
 
     def test_p8_restart_reconciles_trade_closed_while_down(self):
         seed_state({"active_trade": active_trade()})
-        self.mock.real_positions = []          # closed externally while engine was down
-        self.mock.orders = [                    # broker records show the real exit
-            {"orderId": "ORD-SL-1", "orderStatus": "TRADED", "averageTradedPrice": 95.0,
-             "securityId": "99991", "transactionType": "SELL"},
-            {"orderId": "ORD-BUY-1", "orderStatus": "TRADED", "averageTradedPrice": 100.0},
-        ]
+        self.seed_broker_trade(active_trade(), stop_status="TRADED", exit_price=95.0)
         self.run_cmd_tick()
         st = json.load(open(se.STATE_FILE))
         self.assertIsNone(st["active_trade"], "closed-while-down trade must be reconciled")
         j = journal()
-        self.assertEqual(j[-1]["exit_reason"], "RESTART_RECONCILED_CLOSED")
+        self.assertEqual(j[-1]["exit_trigger"], "RESTART_RECONCILED_CLOSED")
+        self.assertEqual(j[-1]["exit_reason"], "EXCHANGE_SL_FILLED")
+        self.assertEqual(j[-1]["execution_source"], "EXCHANGE_STOP")
+        exit_fill, = j[-1]["exit_proof"]["exits"]
+        self.assertEqual(exit_fill["id"], "ORD-SL-1")
+        self.assertTrue(j[-1]["fills_verified"])
+        self.assertEqual(self.mock.writes(), [])
         self.assertAlmostEqual(j[-1]["exit_price"], 95.0, msg="exit price must come from broker fills")
 
     def test_p8_restart_resumes_still_open_position(self):
         seed_state({"active_trade": active_trade()})
-        self.mock.real_positions = [{"securityId": "99991", "netQty": 65}]
+        self.seed_broker_trade(active_trade(), stop_status="PENDING")
         self.mock.candles["99991"] = bars(30, 80.0, 100)   # SL hit -> managed exit
         self.mock.status_queue = ["TRADED"]
         self.run_cmd_tick()
@@ -486,7 +646,7 @@ class SafeBehaviorRegression(unittest.TestCase):
 
     def test_p8_orphan_position_flattened_on_restart(self):
         seed_state({"active_trade": None})      # engine forgot the trade; broker still has it
-        self.mock.real_positions = [{"securityId": "99991", "netQty": 65}]
+        self.seed_broker_trade(active_trade())
         self.mock.status_queue = ["TRADED"]
         self.run_cmd_tick()
         self.assertEqual(self.mock.real_positions[0]["netQty"], 0, "orphan position must be flattened")
@@ -505,39 +665,39 @@ class SafeBehaviorRegression(unittest.TestCase):
              "net_pnl": 0.0, "gross_pnl": 0.0}
         e.update(over); return e
 
-    def _seed_state_from_file(self):
-        st = json.load(open(se.STATE_FILE))
-        st["daily_date"] = TODAY
-        json.dump(st, open(se.STATE_FILE, "w"))
-        return st
+    def record_verified_exit(self, exit_price, reason, *, order_number, entry_minute):
+        state = se.load_state()
+        trade = active_trade(
+            order_id=f"HIST-BUY-{order_number}", sl_order_id=f"HIST-EXIT-{order_number}",
+            entry_time=f"{TODAY}T10:{entry_minute:02}:00+05:30",
+        )
+        state["active_trade"] = trade
+        se.save_state(state)
+        prior_orders = self.mock.orders
+        self.seed_broker_trade(trade, stop_status="TRADED", exit_price=exit_price)
+        self.mock.orders = prior_orders + self.mock.orders
+        self.assertTrue(se._finalize_closed_trade(make_client(self.mock), state, trade, reason))
 
     def test_p9_green_day_keeps_trading_no_halt_at_500(self):
-        # +₹569 banked and still green -> NO halt: recovery mode maximizes a green day
-        self._journal_seed([self._entry(net_pnl=517.0), self._entry(net_pnl=52.25)])
-        st = self._seed_state_from_file()
-        c = make_client(self.mock)
-        se._finalize_closed_trade(c, st, active_trade(), "TARGET_HIT", 105.0)
-        st2 = json.load(open(se.STATE_FILE))
-        self.assertFalse(st2["daily_halted"], "a win on a green day must NOT halt — maximize recovery")
+        self.record_verified_exit(110.0, "TARGET_HIT", order_number=1, entry_minute=0)
+        self.record_verified_exit(102.0, "TARGET_HIT", order_number=2, entry_minute=5)
+        self.record_verified_exit(105.0, "TARGET_HIT", order_number=3, entry_minute=10)
+        st = se.load_state()
+        self.assertFalse(st["daily_halted"], "a win on a green day must NOT halt — maximize recovery")
 
     def test_p9_green_floor_halts_when_banked_profit_breached(self):
-        # day peak +₹569 (>= floor) then a big loss drops today below the floor -> halt & protect
-        self._journal_seed([self._entry(net_pnl=517.0), self._entry(net_pnl=52.25)])
-        st = self._seed_state_from_file()
-        c = make_client(self.mock)
-        se._finalize_closed_trade(c, st, active_trade(), "STOP_LOSS_HIT", 85.0)   # big loss
-        st2 = json.load(open(se.STATE_FILE))
-        self.assertTrue(st2["daily_halted"], "breach of the ₹500 banked-profit floor must halt the day")
-        self.assertIn("Green floor", st2["daily_halt_reason"])
+        self.record_verified_exit(110.0, "TARGET_HIT", order_number=1, entry_minute=0)
+        self.record_verified_exit(102.0, "TARGET_HIT", order_number=2, entry_minute=5)
+        self.record_verified_exit(85.0, "STOP_LOSS_HIT", order_number=3, entry_minute=10)
+        st = se.load_state()
+        self.assertTrue(st["daily_halted"], "breach of the ₹500 banked-profit floor must halt the day")
+        self.assertIn("Green floor", st["daily_halt_reason"])
 
     def test_p9_small_green_day_not_floored_keeps_trading(self):
-        # day peak only +₹300 (< floor): a single pullback loss must NOT halt (floor never banked)
-        self._journal_seed([self._entry(net_pnl=300.0)])
-        st = self._seed_state_from_file()
-        c = make_client(self.mock)
-        se._finalize_closed_trade(c, st, active_trade(), "STOP_LOSS_HIT", 90.0)
-        st2 = json.load(open(se.STATE_FILE))
-        self.assertFalse(st2["daily_halted"], "no halt unless the ₹500 floor was actually banked")
+        self.record_verified_exit(105.0, "TARGET_HIT", order_number=1, entry_minute=0)
+        self.record_verified_exit(90.0, "STOP_LOSS_HIT", order_number=2, entry_minute=5)
+        st = se.load_state()
+        self.assertFalse(st["daily_halted"], "no halt unless the ₹500 floor was actually banked")
 
     def test_p9_setup_budget_blocks_third_same_setup_entry(self):
         # 2 ORB_IGNITE LONG entries done today -> a 3rd same-setup entry must be refused
@@ -613,7 +773,7 @@ class SafeBehaviorRegression(unittest.TestCase):
     def test_p9_stale_equity_short_exits_after_20_min(self):
         # equity position flat for >20 min exits as STALE instead of riding to the SL
         seed_state({"active_trade": self._equity_active("10:05:00")})   # held 25 min by NOW=10:30
-        self.mock.real_positions = [{"securityId": "46681", "netQty": -575}]
+        self.seed_broker_trade(se.load_state()["active_trade"], stop_status="PENDING")
         self.mock.candles["46681"] = bars(30, 100.0, 100)   # flat LTP == entry
         self.mock.status_queue = ["TRADED"]
         self.run_cmd_tick()
@@ -625,9 +785,13 @@ class SafeBehaviorRegression(unittest.TestCase):
     def test_p9_fresh_equity_short_not_stale_killed(self):
         # control: held only 15 min -> no stale exit, trade stays open
         seed_state({"active_trade": self._equity_active("10:15:00")})
-        self.mock.real_positions = [{"securityId": "46681", "netQty": -575}]
+        self.seed_broker_trade(se.load_state()["active_trade"], stop_status="PENDING")
         self.mock.candles["46681"] = bars(30, 100.0, 100)
-        self.run_cmd_tick()
+        monitor = se.monitor_active_trade_loop
+        with patch.object(se, "monitor_active_trade_loop",
+                          side_effect=lambda *args, **kwargs: monitor(
+                              *args, **dict(kwargs, max_seconds=0.03))):
+            self.run_cmd_tick()
         self.assertEqual(journal(), [],
                          "equity position younger than EQUITY_STALE_MINS must not be stale-killed")
 
