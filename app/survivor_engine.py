@@ -300,8 +300,10 @@ def send_telegram(message: str) -> bool:
     return False
 
 
-def _entry_window_open():
-    return "09:20" <= datetime.now(IST).strftime("%H:%M") <= "14:15"
+def _entry_window_open(hhmm=None):
+    if hhmm is None:
+        hhmm = datetime.now(IST).strftime("%H:%M")
+    return ("09:30" <= hhmm <= "11:30") or ("13:30" <= hhmm <= "14:15")
 
 
 def _exit_coordinator(client, *, budget=None):
@@ -368,6 +370,8 @@ def _get_latest_tick_ltp(client: "SurvivorDhanClient", security_id: str,
 def _entry_market_open(trade):
     now = datetime.now(IST)
     try:
+        if trade["exchange_segment"] == "NSE_EQ" and trade.get("regime") == "CHOPPY":
+            return False
         calendar = ExchangeCalendar(BASE_DIR)
         calendar.expected_bars(now)
         if trade["exchange_segment"] == "NSE_FNO":
@@ -1387,6 +1391,10 @@ def scan_equity_candidates(client: SurvivorDhanClient) -> Optional[Dict]:
             if atr <= 0 or close <= 40:
                 continue
 
+            regime = str(curr.get("regime", "TRENDING"))
+            if regime == "CHOPPY":
+                continue
+
             # Long 3-min Supertrend + EMA + Volume Burst
             if st_dir == 1 and close > ema9 > ema21 and close > vwap and 57.0 <= rsi <= 76.0 and rel_vol >= 1.25 and close >= prev["high"]:
                 score = (rel_vol * 20.0) + (rsi - 50.0)
@@ -1395,6 +1403,7 @@ def scan_equity_candidates(client: SurvivorDhanClient) -> Optional[Dict]:
                     "security_id": sec_id,
                     "exchange_segment": "NSE_EQ",
                     "instrument_type": "EQUITY",
+                    "regime": regime,
                     "direction": "LONG",
                     "ltp": round(close, 2),
                     "atr": round(atr, 2),
@@ -1414,6 +1423,7 @@ def scan_equity_candidates(client: SurvivorDhanClient) -> Optional[Dict]:
                     "security_id": sec_id,
                     "exchange_segment": "NSE_EQ",
                     "instrument_type": "EQUITY",
+                    "regime": regime,
                     "direction": "SHORT",
                     "ltp": round(close, 2),
                     "atr": round(atr, 2),
@@ -2519,7 +2529,7 @@ def _tick_with_state(*, policy: RolePolicy, quiet_scan: bool, owner_fd):
             print("Dry tick observed an active trade.")
         return
 
-    # 5. SCAN FOR NEW ENTRY (Only between 09:20 and 14:15 IST — no late entries in final 55 mins, max 4 trades/day)
+    # 5. SCAN FOR NEW ENTRY (entry windows and max 4 trades/day)
     if state.get("daily_halted"):
         if not quiet_scan:
             print(f"⏸️ Daily halt active: {state.get('daily_halt_reason')}")
@@ -2528,11 +2538,11 @@ def _tick_with_state(*, policy: RolePolicy, quiet_scan: bool, owner_fd):
         if not quiet_scan:
             print(f"⛔ Entries blocked: {state.get('entries_blocked_reason')}")
         return
-    if not ("09:20" <= hhmm <= "14:15"):
+    if not _entry_window_open(hhmm):
         if live:
             save_state(state)
         if not quiet_scan:
-            print(f"⏳ Outside active entry window ({hhmm} IST — cutoff 14:15 IST). Equity: ₹{net_liq:,.2f} | Tier: {tier['tier']}")
+            print(f"⏳ Outside active entry window ({hhmm} IST — allowed 09:30–11:30 and 13:30–14:15 IST). Equity: ₹{net_liq:,.2f} | Tier: {tier['tier']}")
         return
     if state.get("daily_trades_count", 0) >= 4:
         if live:
@@ -2747,6 +2757,7 @@ def _tick_with_state(*, policy: RolePolicy, quiet_scan: bool, owner_fd):
             "security_id": eq_cand["security_id"],
             "exchange_segment": "NSE_EQ",
             "instrument_type": "EQUITY",
+            "regime": eq_cand.get("regime"),
             "direction": eq_cand["direction"],
             "quantity": qty,
             "tick_size": eq_tick,

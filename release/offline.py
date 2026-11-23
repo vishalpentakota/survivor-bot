@@ -4,7 +4,7 @@ import argparse
 from base64 import urlsafe_b64encode
 from contextlib import redirect_stdout
 import ctypes
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import errno
 from hashlib import sha256
 from importlib.metadata import distributions
@@ -256,6 +256,7 @@ def fixture(engine):
     proof = dict(trade=engine._trade_identity(row), epoch="synthetic-epoch", instrument=instrument,
                  entry=entry, exits=[exit_fill])
     row.update(engine._closure_fields(proof))
+    state["applied_exit_proofs"] = [proof["trade"]]
     ledger = dict(cycle=None, alerts={}, fills={}, flat_book={"entry-fixture": 65, "exit-fixture": 65},
                   replay_epoch=proof["epoch"], replay_executions=engine._proof_executions(proof),
                   replay_check="verification_required")
@@ -273,9 +274,7 @@ def fixture(engine):
     print(f"Candidate parsed halted risk state, verified journal proof and replay-fenced exit ledger; net {row['net_pnl']:.2f}")
 
 
-def rollback(engine):
-    state = json.loads(Path(engine.STATE_FILE).read_text())
-    journal = json.loads(Path(engine.JOURNAL_FILE).read_text())
+def rollback(engine, state, journal):
     require(engine.load_state() == state, "Rollback loader lost risk state")
     require(engine.load_journal() == journal, "Rollback loader lost journal rows")
     print("Deployed loaders preserved halted risk state and journal fields on read")
@@ -292,12 +291,12 @@ def rollback(engine):
     require(json.loads(Path(engine.JOURNAL_FILE).read_text()) == journal,
             "Deployed reconcile altered the fixture journal")
     require("survivor_exits.json" not in opened, "Deployed reconcile unexpectedly consumes exit ledger")
-    print("BLOCKED: deployed reconcile reported flat without reading the candidate replay-fenced ledger")
+    print("Scratch rollback reconcile completed after external preflight")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=(*SUCCESS, "build", "fixture", "rollback", "tests"))
+    parser.add_argument("action", choices=(*SUCCESS, "build", "fixture", "rollback", "tests", "safety-tests"))
     parser.add_argument("fresh", type=Path)
     parser.add_argument("--local-python", type=Path)
     args = parser.parse_args()
@@ -307,24 +306,38 @@ def main():
         build(args.local_python.absolute(), fresh)
         return
     isolate(fresh)
-    if args.action == "tests":
+    kind = json.loads((ROOT / "manifest.json").read_text())["artifact"]
+    require(kind in {"candidate", "rollback"}, "Unknown artifact type")
+    require((kind == "rollback") == (args.action == "rollback"),
+            "Rollback artifacts require the gated rollback action")
+    if args.action in {"tests", "safety-tests"}:
         import multiprocessing.heap
         import unittest
         multiprocessing.heap.Arena._dir_candidates = [str(ROOT)]
-        suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"))
+        pattern = "test_safe_behavior.py" if args.action == "safety-tests" else "test_*.py"
+        suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern=pattern)
         result = unittest.TextTestRunner(verbosity=1).run(suite)
         require(result.testsRun > 0 and result.wasSuccessful(), "Exported tests failed")
         return
+    if args.action == "rollback":
+        sys.path.insert(0, str(ROOT))
+        from rollback_preflight import preflight
+        try:
+            state, journal = preflight(APP, now=Clock.now(timezone.utc))
+        except RuntimeError as exc:
+            print(exc, file=sys.stderr)
+            return 2
+        print("Rollback preflight accepted verified synthetic flat evidence", flush=True)
     import survivor_engine as engine
     require(Path(engine.__file__).resolve().parent == APP, "Engine was not loaded from artifact")
     stub(engine)
     if args.action == "fixture":
         fixture(engine)
     elif args.action == "rollback":
-        rollback(engine)
+        rollback(engine, state, journal)
     else:
         smoke(engine, args.action)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
