@@ -25,7 +25,7 @@ class VerifiedExits(unittest.TestCase):
         self.sdk = self.sdk.dhanhq.return_value
         self.sdk.MARKET = "MARKET"
         self.sdk.SL = "SL"
-        self.sdk.get_order_list.return_value = self.response([])
+        self.book(self.opening_orders())
         self.sdk.get_positions.return_value = self.response([self.position(5)])
 
     @staticmethod
@@ -55,6 +55,11 @@ class VerifiedExits(unittest.TestCase):
         return dict(self.position(0), orderId=oid, transactionType=side, orderStatus=status,
                     quantity=quantity, filledQty=filled, averageTradedPrice=price, **extra)
 
+    def opening_orders(self, net=5, security_id="23"):
+        side = "BUY" if net > 0 else "SELL"
+        row = self.row("opening", side, "TRADED", abs(net), abs(net))
+        return {"opening": dict(row, securityId=security_id)} if net else {}
+
     def book(self, rows):
         self.sdk.get_order_list.side_effect = lambda: self.response(list(rows.values()))
         self.sdk.get_order_by_id.side_effect = lambda oid: self.response(rows[oid])
@@ -65,7 +70,7 @@ class VerifiedExits(unittest.TestCase):
             side, qty = kwargs['transaction_type'], kwargs['quantity']
             status, filled, remaining = next(outcomes)
             with open(self.engine.EXIT_LEDGER, encoding='utf-8') as ledger:
-                intent = json.load(ledger)['cycle']['pending']
+                intent, = json.load(ledger)['cycle']['pending_by_key'].values()
             self.assertEqual((intent['oid'], intent['tag'], intent['quantity']), (None, kwargs['tag'], qty))
             rows[oid] = self.row(oid, side, status, qty, filled, correlationId=kwargs['tag'],
                                  createTime='2026-11-23 10:02:00')
@@ -78,7 +83,7 @@ class VerifiedExits(unittest.TestCase):
             with self.subTest(net=net):
                 self.engine.EXIT_LEDGER.unlink(missing_ok=True)
                 self.sdk.reset_mock()
-                rows = {}
+                rows = self.opening_orders(net)
                 self.book(rows)
                 self.sdk.get_positions.return_value = self.response([self.position(net)])
                 self.exit_submit(rows, iter([('TRADED', 5, 0)]))
@@ -90,14 +95,14 @@ class VerifiedExits(unittest.TestCase):
                     self.sdk.place_order.assert_not_called()
 
     def test_terminal_reject_and_partial_cancel_reduce_retry_size(self):
-        rows = {}
+        rows = self.opening_orders()
         self.book(rows)
         self.exit_submit(rows, iter([('REJECTED', 0, 5), ('CANCELLED', 2, 3), ('TRADED', 3, 0)]))
         self.assertTrue(self.client().emergency_flatten_all().flat)
         self.assertEqual([call.kwargs['quantity'] for call in self.sdk.place_order.call_args_list], [5, 5, 3])
 
     def test_partial_cancel_with_stale_position_blocks_retry(self):
-        rows = {}
+        rows = self.opening_orders()
         self.book(rows)
         self.exit_submit(rows, iter([('CANCELLED', 2, 5), ('TRADED', 3, 0)]))
         self.assertFalse(self.client().emergency_flatten_all().flat)
@@ -107,7 +112,7 @@ class VerifiedExits(unittest.TestCase):
         self.assertEqual(self.sdk.place_order.call_args.kwargs['quantity'], 3)
 
     def test_unavailable_or_malformed_position_preserves_protection(self):
-        rows = {'sl': self.row('sl', 'SELL', 'PENDING', 5, 0)}
+        rows = self.opening_orders() | {'sl': self.row('sl', 'SELL', 'PENDING', 5, 0)}
         self.book(rows)
         for reply in ({'status': 'failure'}, self.response([{'netQty': 0}]),
                       self.response([self.position(3.5)]), self.response(None)):
@@ -118,18 +123,18 @@ class VerifiedExits(unittest.TestCase):
         self.sdk.place_order.assert_not_called()
 
     def test_unknown_order_or_bad_terminal_count_keeps_intent(self):
-        rows = {}
+        rows = self.opening_orders()
         self.book(rows)
         self.exit_submit(rows, iter([('TRADED', 2, 3)]))
         self.assertFalse(self.client().emergency_flatten_all().flat)
-        rows['1']['orderStatus'] = 'UNRECOGNIZED'
+        rows['2']['orderStatus'] = 'UNRECOGNIZED'
         self.assertFalse(self.client().emergency_flatten_all().flat)
         rows.clear()
         self.assertFalse(self.client().emergency_flatten_all().flat)
         self.sdk.place_order.assert_called_once()
 
     def test_cancel_failure_then_late_fill_before_confirmed_cancel(self):
-        rows = {'sl': self.row('sl', 'SELL', 'PENDING', 5, 0)}
+        rows = self.opening_orders() | {'sl': self.row('sl', 'SELL', 'PENDING', 5, 0)}
         self.book(rows)
         self.sdk.cancel_order.return_value = {'status': 'failure'}
         self.assertFalse(self.client().emergency_flatten_all().flat)
@@ -143,7 +148,7 @@ class VerifiedExits(unittest.TestCase):
         self.assertEqual(self.sdk.place_order.call_args.kwargs['quantity'], 3)
 
     def test_lost_ack_resolves_only_by_correlated_terminal_order(self):
-        rows = {}
+        rows = self.opening_orders()
         self.book(rows)
 
         def accepted(**params):
@@ -178,13 +183,13 @@ class VerifiedExits(unittest.TestCase):
         self.sdk.place_order.assert_called_once()
 
     def test_durable_alert_survives_order_resolution_and_restart(self):
-        rows = {}
+        rows = self.opening_orders()
         self.book(rows)
         self.exit_submit(rows, iter([('PENDING', 0, 5)]))
         with patch.object(self.engine, 'EXIT_ESCALATION_SECONDS', 0),              patch.object(self.engine, 'send_telegram', side_effect=OSError) as notify:
             self.assertFalse(self.client().emergency_flatten_all().flat)
             notify.assert_called_once()
-        rows['1'].update(orderStatus='TRADED', filledQty=5)
+        rows['2'].update(orderStatus='TRADED', filledQty=5)
         self.sdk.get_positions.return_value = self.response([])
         with patch.object(self.engine, 'send_telegram', return_value=False) as notify:
             self.assertTrue(self.client().emergency_flatten_all().flat)
@@ -243,12 +248,13 @@ class VerifiedExits(unittest.TestCase):
                 runpy.run_path(str(staged), run_name='__main__')
             self.assertEqual(error.exception.code, 1)
             self.sdk.get_positions.return_value = self.response([])
+            self.book({})
             runpy.run_path(str(staged), run_name='__main__')
         self.sdk.place_order.assert_not_called()
         self.http.put.assert_not_called()
 
     def test_stale_position_after_completed_cycle_cannot_reverse_account(self):
-        rows = {}
+        rows = self.opening_orders()
         self.book(rows)
         self.exit_submit(rows, iter([('TRADED', 5, 0)]))
         self.assertTrue(self.client().emergency_flatten_all().flat)
@@ -259,21 +265,22 @@ class VerifiedExits(unittest.TestCase):
     def test_ack_save_failure_recovers_original_intent(self):
         import verified_exit
 
-        rows = {}
+        rows = self.opening_orders()
         self.book(rows)
         self.exit_submit(rows, iter([('TRADED', 5, 0)]))
         original = verified_exit.persist
 
         def fail_after_ack(path, ledger):
-            pending = (ledger['cycle'] or {}).get('pending')
-            if pending and pending['oid']:
+            pending = (ledger['cycle'] or {}).get('pending_by_key', {})
+            if any(intent['oid'] for intent in pending.values()):
                 raise OSError('simulated storage failure after broker ack')
             original(path, ledger)
 
         with patch.object(verified_exit, 'persist', side_effect=fail_after_ack):
             self.assertFalse(self.client().emergency_flatten_all().flat)
         ledger = json.loads(self.engine.EXIT_LEDGER.read_text())
-        self.assertIsNone(ledger['cycle']['pending']['oid'])
+        intent, = ledger['cycle']['pending_by_key'].values()
+        self.assertIsNone(intent['oid'])
         self.assertTrue(self.client().emergency_flatten_all().flat)
         self.sdk.place_order.assert_called_once()
 
@@ -306,7 +313,7 @@ class VerifiedExits(unittest.TestCase):
         candidate = dict(security_id='23', symbol='STAGED', direction='LONG', ltp=100, atr=1, reason='fixture')
         with patch.object(engine, 'datetime', wraps=datetime) as clock,              patch.object(engine, 'load_state', return_value=state), patch.object(engine, 'save_state'),              patch.object(engine, 'acquire_engine_lock', return_value=9), patch.object(engine, 'release_engine_lock'),              patch.object(engine, 'INDEX_UNIVERSE', {}), patch.object(engine, 'scan_equity_candidates', return_value=candidate):
             clock.now.return_value = now
-            engine.cmd_tick(policy=engine.RolePolicy(trade=True))
+            self.assertEqual(engine.cmd_tick(policy=engine.RolePolicy(trade=True)), 1)
         self.assertTrue(state['active_trade']['flatten_pending'])
         self.assertEqual(state['active_trade']['order_id'], 'entry')
         self.assertFalse(Path(engine.JOURNAL_FILE).exists())

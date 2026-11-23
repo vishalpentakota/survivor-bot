@@ -58,7 +58,7 @@ def orders(broker):
     result = {}
     for row in rows:
         oid = identifier(row["orderId"])
-        if oid in result or row["orderStatus"] not in STATUSES:
+        if oid in result:
             raise ValueError("Invalid order book entry")
         result[oid] = row.copy()
     return result
@@ -77,7 +77,7 @@ def fill(row):
     quantity = integer(row["quantity"])
     filled = integer(row["filledQty"] if "filledQty" in row else row["tradedQuantity"])
     status = row["orderStatus"]
-    if (quantity <= 0 or not 0 <= filled <= quantity
+    if (status not in STATUSES or quantity <= 0 or not 0 <= filled <= quantity
             or status == "TRADED" and filled != quantity or status == "REJECTED" and filled):
         raise ValueError("Inconsistent order quantities")
     return filled
@@ -167,15 +167,37 @@ class ExitCoordinator:
         self.save(state)
         return state["cycle"]
 
-    def escalate(self, state, message):
+    def escalate(self, state, message, verified):
         cycle = state["cycle"]
         if cycle and not cycle["escalated"] and time.time() >= cycle["deadline"]:
             cycle["escalated"] = True
-            pending = cycle["pending"] or {}
-            identity = pending.get("oid") or pending.get("tag")
-            state["alerts"][cycle["id"]] = f"{message}. Pending order or intent {identity or 'unverified'}"
+            keys = set(verified) | {tuple(p["key"]) for p in cycle["pending_by_key"].values()}
+            unknown = cycle.get("account_unknown", {})
+            details = []
+            if unknown:
+                details.append(f"instrument UNKNOWN, intent/order {unknown['oid']}, "
+                               "confirmed fills UNKNOWN, remaining verified qty UNKNOWN")
+            for key in sorted(keys):
+                pending = cycle["pending_by_key"].get(self.key_id(key), {})
+                identity = pending.get("oid") or pending.get("tag") or "UNKNOWN"
+                confirmed = {oid: qty for oid, (instrument_key, qty, _) in cycle["confirmed"].items()
+                             if tuple(instrument_key) == key}
+                confirmed.update({oid: qty for oid, (instrument_key, qty) in cycle.get("observed", {}).items()
+                                  if tuple(instrument_key) == key})
+                if identity == "UNKNOWN" and confirmed:
+                    identity = ", ".join(confirmed)
+                remaining = verified.get(key, "UNKNOWN")
+                details.append(f"instrument {key}, intent/order {identity}, confirmed fills {confirmed}, "
+                               f"remaining verified qty {remaining}")
+            state["alerts"][cycle["id"]] = f"{message}. " + (
+                "; ".join(details) or "instrument UNKNOWN, intent/order UNKNOWN, "
+                "confirmed fills UNKNOWN, remaining verified qty UNKNOWN")
             self.save(state)
             self.deliver(state)
+
+    @staticmethod
+    def key_id(key):
+        return json.dumps(key, separators=(",", ":"))
 
     def snapshot(self):
         before = orders(self.broker)
@@ -184,27 +206,213 @@ class ExitCoordinator:
             raise ValueError("Order book changed during position read")
         return before, exposure
 
-    def settle(self, state, cycle, book, exposure):
-        pending = cycle["pending"]
+    def flatten(self, max_retries):
+        with locked(self.path) as state:
+            self.deliver(state)
+            cycle = state["cycle"] or self.start(state, flatten=True)
+            if not cycle["flatten"] and cycle.get("protected"):
+                cycle["deadline"] = time.time() + self.deadline
+            cycle["flatten"] = True
+            pending = cycle.setdefault("pending_by_key", {})
+            if cycle["pending"]:
+                legacy = cycle["pending"]
+                if "key" not in legacy:
+                    # Preserve uncertainty about the previously attempted cancellation.
+                    cycle["account_unknown"] = legacy
+                else:
+                    pending[self.key_id(legacy["key"])] = legacy
+                cycle["pending"] = None
+            self.save(state)
+            message = "Exit has no verified terminal order and consistent broker position"
+            verified = {}
+            attempts = defaultdict(int)
+            deferred = set()
+            try:
+                for _ in range(self.polls + max_retries):
+                    verified = {}
+                    book, exposure = self.snapshot()
+                    grouped = defaultdict(dict)
+                    for oid, row in book.items():
+                        grouped[instrument(row)][oid] = row
+                    unknown = cycle.get("account_unknown")
+                    if unknown:
+                        oid = unknown["oid"]
+                        row = book.get(oid)
+                        if not row or row["orderStatus"] not in TERMINAL or not same_execution(
+                                row, order_detail(self.broker, oid)):
+                            break
+                        del cycle["account_unknown"]
+                        self.save(state)
+
+                    keys = dict.fromkeys([*exposure, *grouped, *(tuple(p["key"]) for p in pending.values()),
+                                          *(tuple(key) for key, _ in cycle["exposure"].values())])
+                    reserved = set()
+                    for intent in pending.values():
+                        for oid, row in book.items():
+                            if (oid == intent["oid"] or intent.get("tag") and row.get("correlationId") == intent["tag"]):
+                                if instrument(row) != tuple(intent["key"]):
+                                    reserved.add(instrument(row))
+                    for key in keys:
+                        verified[key] = "UNKNOWN"
+                    changed = False
+                    for key in keys:
+                        key_id = self.key_id(key)
+                        if key_id in deferred or key in reserved:
+                            continue
+                        try:
+                            changed = self.advance(state, cycle, key, grouped[key], book, exposure,
+                                                   attempts, max_retries, deferred, verified)
+                        except (KeyError, ValueError, TypeError):
+                            # Identified but unverified data blocks only its instrument.
+                            continue
+                        if changed:
+                            break
+                    if changed:
+                        continue
+                    if (not pending and not any(exposure.values()) and
+                            not any(row["orderStatus"] in WORKING for row in book.values()) and
+                            all(value == 0 for value in verified.values()) and
+                            self.snapshot() == (book, exposure)):
+                        if cycle.get("unresolved"):
+                            self.escalate(state, message, verified)
+                        state["flat_book"] = (state["flat_book"] or {}) | {oid: fill(row) for oid, row in book.items()}
+                        state["cycle"] = None
+                        self.save(state)
+                        return FlattenResult("Broker confirmed flat with no outstanding orders", flat=True)
+                    time.sleep(self.interval)
+            except Exception as exc:
+                verified = {key: "UNKNOWN" for key in verified}
+                message = f"Exit verification interrupted ({type(exc).__name__})"
+            if not cycle.get("unresolved"):
+                cycle["unresolved"] = True
+                self.save(state)
+            self.escalate(state, message, verified)
+            return FlattenResult(f"Flatten INCOMPLETE: {message}")
+
+    def detail(self, oid):
+        try:
+            return order_detail(self.broker, oid)
+        except Exception as exc:
+            raise ValueError("Order detail unavailable") from exc
+
+    def advance(self, state, cycle, key, rows, book, exposure, attempts, limit, deferred, verified):
+        key_id = self.key_id(key)
+        pending = cycle["pending_by_key"].get(key_id)
+        net = exposure.get(key, 0)
+        for oid, (stored_key, filled, status) in cycle["confirmed"].items():
+            if tuple(stored_key) == key and (
+                    oid not in rows or rows[oid]["orderStatus"] != status or fill(rows[oid]) != filled):
+                return False
+        for stored_key, expected in cycle["exposure"].values():
+            if tuple(stored_key) == key and net != expected:
+                return False
+
+        if pending:
+            oid = pending["oid"]
+            if oid is None:
+                matches = [oid for oid, row in book.items() if row.get("correlationId") == pending["tag"]]
+                if len(matches) != 1:
+                    return False
+                oid = matches[0]
+            row = rows.get(oid)
+            if not row:
+                return False
+            detail = self.detail(oid)
+            if (not same_execution(row, detail) or row["transactionType"] != pending["side"]
+                    or integer(row["quantity"]) != pending["quantity"]):
+                return False
+            if pending.get("tag") and any(candidate.get("correlationId", pending["tag"]) != pending["tag"]
+                                          for candidate in (row, detail)):
+                return False
+            cycle.setdefault("observed", {})[oid] = [list(key), fill(row)]
+            if row["orderStatus"] in TERMINAL:
+                return self.settle(state, cycle, book, exposure, key_id=key_id)
+            if pending.get("cancel_requested"):
+                if pending.get("cancel_rejected") and pending.get("cancel_attempts", 1) < 2:
+                    if fill(row) != pending["filled"] or net != pending["net"]:
+                        return False
+                    signed, _ = self.execution_net(state, cycle, key, rows)
+                    if signed != net or self.snapshot() != (book, exposure):
+                        return False
+                    self.cancel(state, cycle, oid, row, exposure, key_id=key_id, prior=pending)
+                    if cycle["pending_by_key"][key_id].get("cancel_rejected"):
+                        deferred.add(key_id)
+                    return True
+            elif pending.get("protection") or pending.get("entry"):
+                expected = pending["net"] + (fill(row) if pending["side"] == "BUY" else -fill(row))
+                if net == expected and self.snapshot() == (book, exposure):
+                    self.cancel(state, cycle, oid, row, exposure, key_id=key_id, prior=pending)
+                    if cycle["pending_by_key"][key_id].get("cancel_rejected"):
+                        deferred.add(key_id)
+                    return True
+            return False
+
+        signed, working = self.execution_net(state, cycle, key, rows)
+        if working:
+            oid, row = working[0]
+            # Cancellation is safe for an identified order with no established
+            # fill discrepancy. Reconcile its terminal execution before exiting.
+            if (signed == net
+                    and same_execution(row, self.detail(oid))
+                    and self.snapshot() == (book, exposure)):
+                self.cancel(state, cycle, oid, row, exposure, key_id=key_id)
+                if cycle["pending_by_key"][key_id].get("cancel_rejected"):
+                    deferred.add(key_id)
+                return True
+            return False
+        if signed != net or self.snapshot() != (book, exposure):
+            return False
+        verified[key] = net
+        if net and attempts[key_id] < limit:
+            attempts[key_id] += 1
+            self.submit(state, cycle, key, net, abs(net), key_id=key_id)
+            return True
+        return False
+
+    def execution_net(self, state, cycle, key, rows):
+        # Dhan's order executions independently establish signed exposure. A
+        # successful but empty book cannot corroborate a nonzero position.
+        signed = 0
+        working = []
+        baseline = state["flat_book"] or {}
+        for oid, row in rows.items():
+            filled = fill(row)
+            side = row["transactionType"]
+            if side not in {"BUY", "SELL"}:
+                raise ValueError("Unverified execution")
+            if oid in baseline:
+                if filled != baseline[oid] or row["orderStatus"] not in TERMINAL:
+                    raise ValueError("Unverified execution")
+                continue
+            if filled:
+                if not same_execution(row, self.detail(oid)):
+                    raise ValueError("Unverified execution")
+                cycle.setdefault("observed", {})[oid] = [list(key), filled]
+            signed += filled if side == "BUY" else -filled
+            if row["orderStatus"] in WORKING:
+                working.append((oid, row))
+
+        return signed, working
+
+    def settle(self, state, cycle, book, exposure, *, key_id=None):
+        pending = cycle["pending"] if key_id is None else cycle["pending_by_key"][key_id]
         oid = pending["oid"]
         if oid is None:
             matches = [key for key, row in book.items() if row.get("correlationId") == pending["tag"]]
             if len(matches) != 1:
                 return False
-            oid = pending["oid"] = matches[0]
-            self.save(state)
+            oid = matches[0]
         if oid not in book or book[oid]["orderStatus"] not in TERMINAL:
             return False
-        row = order_detail(self.broker, oid)
+        row = self.detail(oid)
         listed = book[oid]
         key = tuple(pending["key"])
         filled = fill(row)
-        if (row["orderStatus"] != listed["orderStatus"]
-                or instrument(row) != key or instrument(listed) != key
-                or row["transactionType"] != pending["side"] or listed["transactionType"] != pending["side"]
-                or integer(row["quantity"]) != pending["quantity"]
-                or integer(listed["quantity"]) != pending["quantity"] or fill(listed) != filled):
+        if (not same_execution(row, listed) or instrument(row) != key
+                or row["transactionType"] != pending["side"]
+                or integer(row["quantity"]) != pending["quantity"]):
             return False
+        cycle["observed"] = cycle.get("observed", {}) | {oid: [list(key), filled]}
         delta = filled - pending["filled"]
         expected = pending["net"] + (delta if pending["side"] == "BUY" else -delta)
         fresh_book, fresh_exposure = self.snapshot()
@@ -213,14 +421,23 @@ class ExitCoordinator:
                 or fresh_exposure.get(key, 0) != expected):
             return False
         if filled and not pending.get("entry"):
-            state["fills"][oid] = list(key)
-        cycle["pending"] = None
+            if pending.get("protection"):
+                source = "EXCHANGE_STOP"
+            elif not pending.get("cancel_requested"):
+                source = "MARKET"
+            else:
+                source = "UNKNOWN"
+            state["fills"][oid] = {"key": list(key), "source": source}
+        if key_id is None:
+            cycle["pending"] = None
+        else:
+            del cycle["pending_by_key"][key_id]
         cycle["confirmed"][oid] = [list(key), filled, row["orderStatus"]]
         cycle["exposure"][oid] = [list(key), expected]
         self.save(state)
         return True
 
-    def submit(self, state, cycle, key, net, qty, *, protection=None, entry=None):
+    def submit(self, state, cycle, key, net, qty, *, protection=None, entry=None, key_id=None):
         security, exchange, product = key
         side = entry["transaction_type"] if entry else ("SELL" if net > 0 else "BUY")
         tag = uuid4().hex[:24]
@@ -229,22 +446,31 @@ class ExitCoordinator:
         cycle["exposure"] = {
             oid: pair for oid, pair in cycle["exposure"].items() if tuple(pair[0]) != key
         }
-        cycle["pending"] = pending
+        if key_id is None:
+            cycle["pending"] = pending
+        else:
+            cycle["pending_by_key"][key_id] = pending
         self.save(state)
         params = dict(security_id=security, exchange_segment=exchange, product_type=product,
                       transaction_type=side, quantity=qty, tag=tag)
         if entry is not None:
             reply = self.broker.place_order(**entry, tag=tag)
         elif protection is None:
-            reply = self.broker._place_exit_order(**params, order_type=self.broker.MARKET, price=0)
+            try:
+                reply = self.broker._place_exit_order(**params, order_type=self.broker.MARKET, price=0)
+            except Exception:
+                return None
         else:
             reply = self.broker.place_order(**params, order_type=self.broker.SL, **protection)
         if isinstance(reply, dict) and reply.get("status") == "success":
-            pending["oid"] = identifier(reply["data"]["orderId"])
+            try:
+                pending["oid"] = identifier(reply["data"]["orderId"])
+            except (KeyError, TypeError, ValueError):
+                return None
             self.save(state)
         return pending["oid"]
 
-    def cancel(self, state, cycle, oid, row, exposure):
+    def cancel(self, state, cycle, oid, row, exposure, *, key_id, prior=None):
         key = instrument(row)
         side = row["transactionType"]
         if side not in {"BUY", "SELL"}:
@@ -252,125 +478,27 @@ class ExitCoordinator:
         cycle["exposure"] = {
             oid: pair for oid, pair in cycle["exposure"].items() if tuple(pair[0]) != key
         }
-        cycle["pending"] = dict(oid=oid, key=list(key), net=exposure.get(key, 0),
-                                side=side, quantity=integer(row["quantity"]), filled=fill(row),
-                                cancel_requested=True, protection=False, entry=cycle["pending"].get("entry", False)
-                                if cycle["pending"] else False)
+        prior = prior or {}
+        pending = dict(oid=oid, key=list(key), net=exposure.get(key, 0),
+                       side=side, quantity=integer(row["quantity"]), filled=fill(row),
+                       cancel_requested=True, protection=prior.get("protection", False),
+                       entry=prior.get("entry", False),
+                       cancel_attempts=prior.get("cancel_attempts", 0) + 1)
+        cycle["pending_by_key"][key_id] = pending
         self.save(state)
-        self.broker.cancel_order(oid)
-
-    def after_flat(self, baseline, book, exposure):
-        if baseline is None:
+        try:
+            reply = self.broker.cancel_order(oid)
+        except Exception:
             return
-        changes = defaultdict(int)
-        for oid, row in book.items():
-            if row["orderStatus"] not in TERMINAL:
-                continue
-            if oid in baseline:
-                if fill(row) != baseline[oid]:
-                    raise ValueError("A previously terminal fill changed")
-                continue
-            filled = fill(row)
-            if filled:
-                side = row["transactionType"]
-                if side not in {"BUY", "SELL"}:
-                    raise ValueError("Invalid execution side")
-                changes[instrument(row)] += filled if side == "BUY" else -filled
-        if any(changes[key] != exposure.get(key, 0) for key in changes.keys() | exposure.keys()):
-            raise ValueError("Broker fills conflict with the last verified flat position")
-
-    def flatten(self, max_retries):
-        with locked(self.path) as state:
-            self.deliver(state)
-            cycle = state["cycle"] or self.start(state, flatten=True)
-            if not cycle["flatten"]:
-                cycle["flatten"] = True
-                if cycle.get("protected"):
-                    cycle["deadline"] = time.time() + self.deadline
-                self.save(state)
-            message = "Exit has no verified terminal order and consistent broker position"
-            try:
-                attempts = 0
-                for _ in range(self.polls + max_retries):
-                    book, exposure = self.snapshot()
-                    for key, expected in cycle["exposure"].values():
-                        if exposure.get(tuple(key), 0) != expected:
-                            raise ValueError("Previously settled position changed")
-                    for oid, (key, filled, status) in cycle["confirmed"].items():
-                        row = book.get(oid, {})
-                        if row.get("orderStatus") != status or instrument(row) != tuple(key) or fill(row) != filled:
-                            raise ValueError("Previously settled order changed")
-                    pending = cycle["pending"]
-                    if pending:
-                        # A known protective order can be cancelled during recovery after
-                        # verifying its identity and current exposure. Market orders settle first.
-                        oid = pending["oid"]
-                        row = book.get(oid, {})
-                        if pending.get("sparse"):
-                            if row.get("orderStatus") not in TERMINAL:
-                                break
-                            row = order_detail(self.broker, oid)
-                            if (not same_execution(row, book[oid]) or fill(row)
-                                    or any(exposure.values())):
-                                break
-                            cycle["confirmed"][oid] = [list(instrument(row)), 0, row["orderStatus"]]
-                            cycle["pending"] = None
-                            self.save(state)
-                            continue
-                        if (pending["protection"] or pending.get("entry")) and row.get("orderStatus") in WORKING and not pending.get("cancel_requested"):
-                            key = tuple(pending["key"])
-                            filled = fill(row)
-                            expected = pending["net"] + (filled if pending["side"] == "BUY" else -filled)
-                            if (instrument(row) == key and row["transactionType"] == pending["side"]
-                                    and integer(row["quantity"]) == pending["quantity"]
-                                    and exposure.get(key, 0) == expected
-                                    and same_execution(row, order_detail(self.broker, oid))):
-                                self.cancel(state, cycle, oid, row, exposure)
-                                continue
-                        if not self.settle(state, cycle, book, exposure):
-                            time.sleep(self.interval)
-                            continue
-                    working = [(oid, row) for oid, row in book.items() if row["orderStatus"] in WORKING]
-                    if working:
-                        oid, row = working[0]
-                        # Sparse legacy order book rows can be cancelled when exposure is
-                        # verified flat. They cannot establish settlement or authorize an exit.
-                        if not all(field in row for field in ("securityId", "exchangeSegment", "productType",
-                                                              "quantity", "transactionType")):
-                            if not any(exposure.values()) and "securityId" not in row:
-                                cycle["pending"] = {"oid": oid, "sparse": True}
-                                self.save(state)
-                                self.broker.cancel_order(oid)
-                            break
-                        if not same_execution(row, order_detail(self.broker, oid)):
-                            raise ValueError("Working order detail disagrees with the order book")
-                        self.cancel(state, cycle, oid, row, exposure)
-                    elif not any(exposure.values()):
-                        self.after_flat(state["flat_book"], book, exposure)
-                        if self.snapshot() != (book, exposure):
-                            raise ValueError("Broker state changed before flat confirmation")
-                        if cycle.get("unresolved"):
-                            self.escalate(state, message)
-                        old = state["flat_book"] or {}
-                        state["flat_book"] = old | {oid: fill(row) for oid, row in book.items()}
-                        state["cycle"] = None
-                        self.save(state)
-                        return FlattenResult("Broker confirmed flat with no outstanding orders", flat=True)
-                    elif attempts >= max_retries:
-                        message = "Exit attempts exhausted with remaining broker exposure"
-                        break
-                    else:
-                        key, net = next((key, net) for key, net in exposure.items() if net)
-                        self.after_flat(state["flat_book"], book, exposure)
-                        self.submit(state, cycle, key, net, abs(net))
-                        attempts += 1
-            except Exception as exc:
-                message = f"Exit verification interrupted ({type(exc).__name__})"
-            if not cycle.get("unresolved"):
-                cycle["unresolved"] = True
-                self.save(state)
-            self.escalate(state, message)
-            return FlattenResult(f"Flatten INCOMPLETE: {message}")
+        if not isinstance(reply, dict):
+            return
+        data = reply.get("data")
+        explicit_reject = isinstance(data, dict) and data.get("orderStatus") == "REJECTED" and data.get("orderId") == oid
+        remarks = reply.get("remarks")
+        if explicit_reject or (reply.get("status") == "failure" and isinstance(remarks, str)
+                               and re.fullmatch(r"(?:.* )?explicit reject(?:ion)?[.!]?", remarks, re.IGNORECASE)):
+            pending["cancel_rejected"] = True
+            self.save(state)
 
     def protect(self, key, transaction_type, quantity, prices):
         result = {"placed": None, "rejected": True, "filled_qty": 0}
@@ -418,7 +546,11 @@ class ExitCoordinator:
             state["cycle"] = None
             self.save(state)
         else:
-            self.after_flat(state["flat_book"], book, exposure)
+            grouped = defaultdict(dict)
+            for oid, row in book.items():
+                grouped[instrument(row)][oid] = row
+            if any(self.execution_net(state, {}, key, rows)[0] for key, rows in grouped.items()):
+                return None
         return book, state["fills"]
 
     def enter(self, params):

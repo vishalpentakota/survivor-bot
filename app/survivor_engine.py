@@ -26,7 +26,6 @@ import errno
 import socket
 import argparse
 import logging
-import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -437,20 +436,7 @@ def save_state(state: Dict) -> None:
     state["last_heartbeat"] = datetime.now(IST).isoformat()
     lock_fd = _acquire_state_lock(timeout=5.0)
     try:
-        # Atomic write: write to temp file, then rename (prevents partial writes)
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=BASE_DIR, suffix=".tmp", prefix=".survivor_state_")
-        try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2)
-            os.replace(tmp_path, STATE_FILE)  # atomic rename
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            # Fallback: direct write if atomic rename failed
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2)
+        persist_exit_data(STATE_FILE, state)
     finally:
         _release_state_lock(lock_fd)
 
@@ -1339,7 +1325,7 @@ def get_survival_tier(net_equity: float) -> Dict:
 
 # ─── Seppuku / Permanent Coma Protocol (Option 2) ──────────────────────────
 
-def trigger_permanent_coma(client: SurvivorDhanClient, state: Dict, net_equity: float, reason: str) -> str:
+def trigger_permanent_coma(client: SurvivorDhanClient, state: Dict, net_equity: float, reason: str) -> tuple[str, int]:
     """
     Option 2 Mortality Protocol:
     1. Immediately flatten all open positions and cancel all pending orders.
@@ -1411,7 +1397,7 @@ def trigger_permanent_coma(client: SurvivorDhanClient, state: Dict, net_equity: 
     with open(OBITUARY_FILE, "w", encoding="utf-8") as f:
         f.write(obituary_text)
 
-    return obituary_text
+    return obituary_text, int(not flatten_actions.flat or bool(state.get("active_trade")))
 
 
 # ─── Main Execution Modes ──────────────────────────────────────────────────
@@ -1622,7 +1608,7 @@ def _verified_trade_fills(client, ledger, active, *, settle=True):
     if entry["orderStatus"] not in TERMINAL or not same_execution(entry, order_detail(client.dhan, entry_id)):
         return None
     if not qty:
-        return 0, 0, 0
+        return 0, 0, 0, None
     entry_px = float(entry["averageTradedPrice"])
     entry_time = entry.get("createTime")
     later_entries = [
@@ -1633,6 +1619,7 @@ def _verified_trade_fills(client, ledger, active, *, settle=True):
     ]
     next_entry = min(later_entries, default=None)
     amounts = []
+    sources = set()
     for oid, row in book.items():
         if row.get("transactionType") != exit_side or row.get("orderStatus") not in TERMINAL:
             continue
@@ -1652,53 +1639,91 @@ def _verified_trade_fills(client, ledger, active, *, settle=True):
             if not math.isfinite(price) or price <= 0 or not same_execution(row, order_detail(client.dhan, oid)):
                 return None
             amounts.append((filled, price))
+            recorded = exits.get(oid)
+            source = recorded.get("source", "UNKNOWN") if isinstance(recorded, dict) else "UNKNOWN"
+            if oid == str(active.get("sl_order_id")) or row.get("orderType") in {"STOP_LOSS", "STOP_LOSS_MARKET"}:
+                source = "EXCHANGE_STOP"
+            elif source == "UNKNOWN" and row.get("orderType") == "MARKET":
+                source = "MARKET"
+            sources.add(source)
     if (sum(filled for filled, _ in amounts) != qty or not math.isfinite(entry_px)
             or entry_px <= 0):
         return None
     final_book, exposure = coordinator.snapshot()
     if final_book != book or any(exposure.values()):
         return None
-    return entry_px, sum(filled * price for filled, price in amounts) / qty, qty
+    execution_source = "UNKNOWN" if "UNKNOWN" in sources else sources.pop() if len(sources) == 1 else "MIXED"
+    return entry_px, sum(filled * price for filled, price in amounts) / qty, qty, execution_source
 
 
-def _finalize_closed_trade(client: SurvivorDhanClient, state: Dict, active: Dict, reason: str) -> bool:
+def _finalize_closed_trade(client: SurvivorDhanClient, state: Dict, active: Dict, reason: str,
+                           *, replay_only: bool = False) -> bool:
     try:
         with exit_lock(EXIT_LEDGER) as ledger:
-            fills = _verified_trade_fills(client, ledger, active)
-            if fills is None:
-                return False
-            entry_px, exit_px, qty = fills
             journal = _read_exit_journal()
-            if qty == 0 or any(str(row.get("order_id")) == str(active["order_id"]) and row.get("reconciled_with_broker")
-                               for row in journal):
-                state["active_trade"] = None
-                save_state(state)
-                return True
-            active = active.copy()
-            gross_pnl = ((exit_px - entry_px) if active["weapon"] == "OPTIONS" or active["direction"] == "LONG"
-                         else (entry_px - exit_px)) * qty
-            net_pnl = round(gross_pnl - ESTIMATED_ROUNDTRIP_CHARGES, 2)
-            now_ist = datetime.now(IST)
-            active.update(quantity=qty, entry_price=entry_px, exit_price=round(exit_px, 2),
-                          exit_time=now_ist.isoformat(), gross_pnl=round(gross_pnl, 2),
-                          net_pnl=net_pnl, exit_reason=reason, reconciled_with_broker=True,
-                          trade_no=len(journal) + 1, logged_at=now_ist.isoformat())
-            journal.append(active)
-            persist_exit_data(JOURNAL_FILE, journal)
+            entry_id = str(active["order_id"])
+            closed = next((row for row in journal if str(row.get("order_id")) == entry_id
+                           and row.get("reconciled_with_broker")), None)
+            if closed is None:
+                if replay_only:
+                    return False
+                fills = _verified_trade_fills(client, ledger, active)
+                if fills is None:
+                    return False
+                entry_px, exit_px, qty, source = fills
+                if qty:
+                    closed = active.copy()
+                    gross_pnl = ((exit_px - entry_px) if active["weapon"] == "OPTIONS" or active["direction"] == "LONG"
+                                 else (entry_px - exit_px)) * qty
+                    now_ist = datetime.now(IST)
+                    trigger = "POSITION_ABSENT" if reason == "EXCHANGE_SL_FILLED" else reason
+                    exit_reason = "EXCHANGE_SL_FILLED" if source == "EXCHANGE_STOP" else trigger
+                    closed.update(quantity=qty, entry_price=entry_px, exit_price=round(exit_px, 2),
+                                  exit_time=now_ist.isoformat(), gross_pnl=round(gross_pnl, 2),
+                                  net_pnl=round(gross_pnl - ESTIMATED_ROUNDTRIP_CHARGES, 2),
+                                  exit_reason=exit_reason, exit_trigger=trigger, execution_source=source,
+                                  reconciled_with_broker=True, trade_no=len(journal) + 1,
+                                  logged_at=now_ist.isoformat())
+                    journal.append(closed)
+                    persist_exit_data(JOURNAL_FILE, journal)
+            updated = state.copy()
+            applied = updated.get("applied_exit_ids", [])
+            if closed and entry_id not in applied:
+                _apply_exit_risk(updated, closed, journal)
+                updated["applied_exit_ids"] = [*applied, entry_id]
+            updated["active_trade"] = None
+            save_state(updated)
+            state.update(updated)
+            if closed:
+                print(f"Trade closed ({closed['exit_reason']}) | {closed['symbol']} | "
+                      f"Net: ₹{closed['net_pnl']:+,.2f}")
     except Exception:
-        logger.exception("Trade closure could not be journaled")
+        logger.exception("Trade closure persistence or verification failed")
         return False
+    return True
+
+
+def _apply_exit_risk(state, active, journal):
+    net_pnl = float(active["net_pnl"])
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
+    closed_day = active["exit_time"][:10]
+    state["total_trades"] = state.get("total_trades", 0) + 1
+    state["realized_pnl_total"] = round(sum(float(row.get("net_pnl", 0)) for row in journal), 2)
+    outcome = "wins" if net_pnl > 0 else "losses"
+    state[outcome] = state.get(outcome, 0) + 1
+    if closed_day != today_str:
+        return
+    if state.get("daily_date", today_str) != today_str:
+        state.update(daily_date=today_str, daily_start_equity=state.get("current_equity", SEED_CAPITAL),
+                     daily_trades_count=1, daily_consecutive_losses=0, daily_halted=False,
+                     daily_halt_reason="", last_sl_direction=None, last_sl_time=None)
 
     # Calculate today's cumulative net P&L across all trades today
-    today_str = now_ist.strftime("%Y-%m-%d")
-    journal = load_journal()
     today_net_pnl = round(sum(float(t.get("net_pnl", 0.0)) for t in journal if str(t.get("entry_time", "")).startswith(today_str)), 2)
     today_gross_pnl = round(sum(float(t.get("gross_pnl", 0.0)) for t in journal if str(t.get("entry_time", "")).startswith(today_str)), 2)
 
-    state["total_trades"] = state.get("total_trades", 0) + 1
-    state["realized_pnl_total"] = round(sum(float(row.get("net_pnl", 0)) for row in journal), 2)
     if net_pnl > 0:
-        state["wins"] = state.get("wins", 0) + 1
         state["daily_consecutive_losses"] = 0
         # DAILY GREEN TARGET LOCK (₹1,500+ Net / ₹1,600+ Gross):
         # Once we bank ₹1,500+ net profit for the day, immediately lock the day in GREEN and halt!
@@ -1706,11 +1731,10 @@ def _finalize_closed_trade(client: SurvivorDhanClient, state: Dict, active: Dict
             state["daily_halted"] = True
             state["daily_halt_reason"] = f"🎯 Daily ₹1,500+ Green Target Banked! (Gross: ₹{today_gross_pnl:+,.2f} | Net: ₹{today_net_pnl:+,.2f}) — Locking green day"
     else:
-        state["losses"] = state.get("losses", 0) + 1
         state["daily_consecutive_losses"] = state.get("daily_consecutive_losses", 0) + 1
         # Record 30-minute Anti-Revenge Cooldown on the losing direction
         state["last_sl_direction"] = active.get("underlying_direction") or active.get("direction")
-        state["last_sl_time"] = now_ist.isoformat()
+        state["last_sl_time"] = active["exit_time"]
         if state["daily_consecutive_losses"] >= 2:
             state["daily_halted"] = True
             state["daily_halt_reason"] = "2 consecutive losses — daily survival shield engaged"
@@ -1724,27 +1748,22 @@ def _finalize_closed_trade(client: SurvivorDhanClient, state: Dict, active: Dict
                     f"🛡️ Green floor ₹{GREEN_FLOOR_INR:.0f} breached (day peak ₹{_peak_net:+,.2f} -> ₹{today_net_pnl:+,.2f}) — protecting banked profit"
                 )
 
-    state["active_trade"] = None
-    save_state(state)
-    print(f"🎯 Trade Closed ({reason}): {active['symbol']} | Buy: ₹{entry_px} -> Sell: ₹{exit_px} | Gross: ₹{gross_pnl:+,.2f} | Net: ₹{net_pnl:+,.2f} | Day Net: ₹{today_net_pnl:+,.2f}")
-
-    return True
-
-
 def _flatten_trade(client, state, active, reason):
     if active:
+        if _finalize_closed_trade(client, state, active, reason, replay_only=True):
+            return 0
         active["flatten_pending"] = True
         active.setdefault("flatten_reason", reason)
         state["active_trade"] = active
         save_state(state)
     result = client.emergency_flatten_all()
-    if result.flat and active:
-        _finalize_closed_trade(client, state, active, active["flatten_reason"])
+    if result.flat and active and not _finalize_closed_trade(client, state, active, active["flatten_reason"]):
+        result = FlattenResult("Broker flat; trade closure remains unresolved")
     print("Exit recovery", result)
-    return result
+    return 0 if result.flat else 1
 
 
-def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: bool = True, max_seconds: int = 260, quiet_scan: bool = False) -> None:
+def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: bool = True, max_seconds: int = 260, quiet_scan: bool = False) -> Optional[int]:
     """
     In-Trade 5-Second Live Monitor Loop:
     Eliminates 5-minute cron blindness! While a trade is open, polls live LTP & Dhan position book
@@ -1762,8 +1781,7 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
         if not live:
             return
         if active.get("flatten_pending") or _recovery_pending(client, active):
-            _flatten_trade(client, state, active, active.get("flatten_reason", "PENDING_EXIT"))
-            return
+            return _flatten_trade(client, state, active, active.get("flatten_reason", "PENDING_EXIT"))
 
         now_ist = datetime.now(IST)
         hhmm = now_ist.strftime("%H:%M")
@@ -1776,8 +1794,7 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
 
         # 1. Mandatory EOD check inside the 5s loop
         if hhmm >= "15:10":
-            _flatten_trade(client, state, active, "EOD_SQUARE_OFF")
-            return
+            return _flatten_trade(client, state, active, "EOD_SQUARE_OFF")
 
         # 2. Check if Exchange SL order already closed the position on Dhan
         #    P1 fail-closed: only a VERIFIED success response may be interpreted;
@@ -1790,8 +1807,7 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
                 if fails >= 3:
                     state["entries_blocked_reason"] = "position API unreliable (3+ consecutive unverified reads)"
                 save_state(state)
-                _flatten_trade(client, state, active, "POSITION_UNVERIFIED")
-                return
+                return _flatten_trade(client, state, active, "POSITION_UNVERIFIED")
             else:
                 if state.get("pos_check_failures"):
                     state["pos_check_failures"] = 0
@@ -1799,8 +1815,7 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
                         state.pop("entries_blocked_reason", None)
                 open_sec_ids = {str(p.get("securityId")) for p in positions if int(p.get("netQty", 0)) != 0}
                 if sec_id not in open_sec_ids:
-                    _flatten_trade(client, state, active, "EXCHANGE_SL_FILLED")
-                    return
+                    return _flatten_trade(client, state, active, "POSITION_ABSENT")
 
         # 3. Resolve current LTP: prefer the latest intraday tick, fall back to
         #    the 1-min candle close. The monitoring logic below runs on EVERY
@@ -1837,8 +1852,7 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
             # REVERSAL BAILOUT: a real peak gain drained into a loss -> exit NOW
             # instead of riding to the original stop (Nov 16-20 autopsy fix).
             if peak_pts >= 2.0 and pts_gain <= -(peak_pts * 0.6):
-                _flatten_trade(client, state, active, "REVERSAL_BAILOUT")
-                return
+                return _flatten_trade(client, state, active, "REVERSAL_BAILOUT")
 
             if active["weapon"] == "OPTIONS":
                 stale_kill = (held_mins >= 25.0 and pts_gain < 4.0)
@@ -1899,8 +1913,7 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
 
         if hit_sl or hit_tp or stale_kill:
             reason = "TARGET_HIT" if hit_tp else ("STOP_LOSS_HIT" if hit_sl else "STALE_THETA_EXIT")
-            _flatten_trade(client, state, active, reason)
-            return
+            return _flatten_trade(client, state, active, reason)
 
         time.sleep(MONITOR_POLL_S)
 
@@ -1912,7 +1925,7 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
             print(f"🛡️ Holding {active['symbol']} | Entry: ₹{active['entry_price']} | SL: ₹{active['stop_loss']} | TP: ₹{active['target_price']} (5s monitor continuing on next tick)")
 
 
-def cmd_tick(live: bool = False, quiet_scan: bool = False, *, policy: Optional[RolePolicy] = None) -> None:
+def cmd_tick(live: bool = False, quiet_scan: bool = False, *, policy: Optional[RolePolicy] = None) -> Optional[int]:
     """
     Single autonomous heartbeat tick (designed to run every 5 min during market hours).
     P5 single-owner engine lock: the WHOLE tick (scan -> entry -> monitor) runs under
@@ -1920,20 +1933,19 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False, *, policy: Optional[R
     """
     policy = policy if policy is not None else _resolve_role("tick", live=live)
     if not policy.trade:
-        _cmd_tick_inner(policy=policy, quiet_scan=quiet_scan)
-        return
+        return _cmd_tick_inner(policy=policy, quiet_scan=quiet_scan)
 
     lock_fd = acquire_engine_lock()
     if lock_fd is None:
         print("⏭️ [ENGINE LOCK] Another tick owns the engine; duplicate tick skipped.")
         return
     try:
-        _cmd_tick_inner(policy=policy, quiet_scan=quiet_scan)
+        return _cmd_tick_inner(policy=policy, quiet_scan=quiet_scan)
     finally:
         release_engine_lock(lock_fd)
 
 
-def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False) -> None:
+def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False) -> Optional[int]:
     """
     Tick body. cmd_tick holds the engine lock for authorized live trading.
     When `quiet_scan=True` (used by `no_agent=True` zero-token cron jobs), routine idle/scan/cooldown
@@ -1956,13 +1968,11 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
         return
     active = state.get("active_trade")
     if live and (_recovery_pending(client, active) or active and active.get("flatten_pending")):
-        _flatten_trade(client, state, active, "RESTART_EXIT_RECOVERY")
-        return
+        return _flatten_trade(client, state, active, "RESTART_EXIT_RECOVERY")
     if state["status"] == "DEAD_COMA":
         return
     if live and _safe_get_positions(client) is None:
-        _flatten_trade(client, state, active, "POSITION_UNVERIFIED")
-        return
+        return _flatten_trade(client, state, active, "POSITION_UNVERIFIED")
     net_liq, avail, utilized, open_pos = client.get_live_equity_and_positions()
 
     now_ist = datetime.now(IST)
@@ -1995,12 +2005,12 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
         if not live:
             print(f"⚠️ Death floor breached: equity ₹{net_liq:,.2f} (floor ₹{DEATH_FLOOR:,.2f}).")
             return
-        obituary = trigger_permanent_coma(
+        obituary, exit_status = trigger_permanent_coma(
             client, state, net_liq,
             f"Account equity (₹{net_liq:,.2f}) breached the ₹{DEATH_FLOOR:,.2f} (-89%) Death Floor."
         )
         print(obituary)
-        return
+        return exit_status
 
     # If still waiting for ₹30,000 top-up and not forced, report standby status cleanly
     if not state["mortality_armed"]:
@@ -2014,16 +2024,13 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
         positions = _safe_get_positions(client)
         active = state.get("active_trade")
         if positions is None:
-            _flatten_trade(client, state, active, "POSITION_UNVERIFIED")
-            return
+            return _flatten_trade(client, state, active, "POSITION_UNVERIFIED")
         state.pop("entries_blocked_reason", None)
         open_ids = {str(row["securityId"]) for row in positions if broker_integer(row["netQty"])}
         if active and str(active["security_id"]) not in open_ids:
-            _flatten_trade(client, state, active, "RESTART_RECONCILED_CLOSED")
-            return
+            return _flatten_trade(client, state, active, "RESTART_RECONCILED_CLOSED")
         if open_ids and not active:
-            _flatten_trade(client, state, None, "ORPHAN_EXIT")
-            return
+            return _flatten_trade(client, state, None, "ORPHAN_EXIT")
 
     state["peak_equity"] = max(state["peak_equity"], net_liq)
     tier = get_survival_tier(net_liq)
@@ -2034,17 +2041,18 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
         already_halted = state.get("daily_halted", False)
         state["daily_halted"] = True
         state["daily_halt_reason"] = f"Daily loss limit hit (₹{daily_pnl:,.2f} <= -₹{tier['daily_max_loss_inr']:,.2f})"
+        exit_status = None
         if live:
-            _flatten_trade(client, state, state.get("active_trade"), "HALT_FLATTENED")
+            exit_status = _flatten_trade(client, state, state.get("active_trade"), "HALT_FLATTENED")
             save_state(state)
         if not (quiet_scan and already_halted):
             print(f"🛑 Daily survival circuit breaker triggered: {state['daily_halt_reason']}. Resting until tomorrow.")
-        return
+        return exit_status
 
     # 3. MANDATORY EOD INTRADAY SQUARE-OFF (3:10 PM IST onwards)
     if hhmm >= "15:10":
         if live:
-            _flatten_trade(client, state, state.get("active_trade"), "EOD_SQUARE_OFF")
+            return _flatten_trade(client, state, state.get("active_trade"), "EOD_SQUARE_OFF")
         elif not quiet_scan:
             print(f"Dry tick reached the EOD square-off window at {hhmm} IST.")
         return
@@ -2052,7 +2060,7 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
     # 4. MANAGE EXISTING ACTIVE TRADE VIA 5-SECOND LIVE MONITOR LOOP
     if state.get("active_trade"):
         if live:
-            monitor_active_trade_loop(client, state, live=True, max_seconds=260, quiet_scan=quiet_scan)
+            return monitor_active_trade_loop(client, state, live=True, max_seconds=260, quiet_scan=quiet_scan)
         elif not quiet_scan:
             print("Dry tick observed an active trade.")
         return
@@ -2211,8 +2219,7 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
                         price=limit_price,
                     )
                     if not entry_id:
-                        _flatten_trade(client, state, None, "ENTRY_UNVERIFIED")
-                        return
+                        return _flatten_trade(client, state, None, "ENTRY_UNVERIFIED")
                     trade_record["order_id"] = entry_id
                     # 2026-11-20: one-shot re-price chase. If the option gapped away from
                     # the limit inside the first settle window, re-price ONCE to the fresh
@@ -2220,8 +2227,7 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
                     # the fail-closed abort below runs exactly as before.
                     if not _chase_unfilled_entry(client, trade_record, str(opt["security_id"]),
                                                  "NSE_FNO", "OPTIDX", float(limit_price)):
-                        _flatten_trade(client, state, trade_record, "ENTRY_SETTLEMENT_EXIT")
-                        return
+                        return _flatten_trade(client, state, trade_record, "ENTRY_SETTLEMENT_EXIT")
                     # P2: fill-confirmed protective SL (no naked SL, no over-hedged partial fills)
                     sl = client.place_protective_sl_order(
                         security_id=opt["security_id"],
@@ -2233,8 +2239,7 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
                     )
                     if not sl["placed"]:
                         state["daily_trades_count"] += 1
-                        _flatten_trade(client, state, trade_record, "UNPROTECTED_POSITION_EXIT")
-                        return
+                        return _flatten_trade(client, state, trade_record, "UNPROTECTED_POSITION_EXIT")
                     trade_record["quantity"] = min(int(trade_record["quantity"]), int(sl["filled_qty"]))
                     trade_record["sl_order_id"] = sl["placed"]
 
@@ -2246,8 +2251,7 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
                 save_state(state)
                 print(f"🚀 [FAST-STRIKE OPTIONS] Entered {qty}x {opt['symbol']} @ ₹{entry_px} | Exchange SL: ₹{sl_px} (Order: {trade_record.get('sl_order_id')}) | Quick TP: ₹{tp_px} (+{target_pts} pts) | {trade_record['reason']}")
                 # Immediately stay alive in the 5-second live monitor loop!
-                monitor_active_trade_loop(client, state, live=live, max_seconds=250, quiet_scan=quiet_scan)
-                return
+                return monitor_active_trade_loop(client, state, live=live, max_seconds=250, quiet_scan=quiet_scan)
 
     # Weapon B: Scan 5x Intraday Liquid Equities
     eq_cand = scan_equity_candidates(client)
@@ -2329,8 +2333,7 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
                 price=0,
             )
             if not entry_id:
-                _flatten_trade(client, state, None, "ENTRY_UNVERIFIED")
-                return
+                return _flatten_trade(client, state, None, "ENTRY_UNVERIFIED")
             trade_record["order_id"] = entry_id
             # P2: fill-confirmed protective SL (no naked SL, no over-hedged partial fills)
             sl = client.place_protective_sl_order(
@@ -2343,8 +2346,7 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
             )
             if not sl["placed"]:
                 state["daily_trades_count"] += 1
-                _flatten_trade(client, state, trade_record, "UNPROTECTED_POSITION_EXIT")
-                return
+                return _flatten_trade(client, state, trade_record, "UNPROTECTED_POSITION_EXIT")
             trade_record["quantity"] = min(int(trade_record["quantity"]), int(sl["filled_qty"]))
             trade_record["sl_order_id"] = sl["placed"]
 
@@ -2355,8 +2357,7 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
         state["daily_trades_count"] += 1
         save_state(state)
         print(f"⚔️ [WEAPON: 5x EQUITY] Entered {eq_cand['direction']} {qty}x {eq_cand['symbol']} @ ₹{entry_px} | Exchange SL: ₹{sl_px} (Order: {trade_record.get('sl_order_id')}) | TP: ₹{tp_px} | {eq_cand['reason']}")
-        monitor_active_trade_loop(client, state, live=live, max_seconds=250, quiet_scan=quiet_scan)
-        return
+        return monitor_active_trade_loop(client, state, live=live, max_seconds=250, quiet_scan=quiet_scan)
 
     if live:
         save_state(state)
@@ -2367,6 +2368,9 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
 def cmd_reconcile(*, policy: Optional[RolePolicy] = None) -> None:
     """Reconcile recorded trades using individually verified order fills."""
     state = load_state()
+    if state.get("active_trade"):
+        print("Reconciliation deferred pending active trade recovery")
+        return
     client = SurvivorDhanClient(policy=policy)
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
     updated_count = 0
@@ -2387,7 +2391,7 @@ def cmd_reconcile(*, policy: Optional[RolePolicy] = None) -> None:
                     continue
                 if not fills or not fills[2]:
                     continue
-                entry, exit_price, qty = fills
+                entry, exit_price, qty, _ = fills
                 short = trade["weapon"] != "OPTIONS" and trade["direction"] == "SHORT"
                 gross = round((entry - exit_price if short else exit_price - entry) * qty, 2)
                 trade.update(entry_price=round(entry, 2), exit_price=round(exit_price, 2), quantity=qty,
@@ -2569,7 +2573,8 @@ if __name__ == "__main__":
     elif args.action == "premarket":
         cmd_premarket(policy=policy)
     elif args.action == "tick":
-        cmd_tick(quiet_scan=args.quiet, policy=policy)
+        if cmd_tick(quiet_scan=args.quiet, policy=policy):
+            sys.exit(1)
     elif args.action == "reconcile":
         cmd_reconcile(policy=policy)
     elif args.action == "flatten":

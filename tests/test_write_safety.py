@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import runpy
 import sys
+import tempfile
 import types
 import unittest
 from datetime import datetime, timedelta
@@ -14,6 +15,22 @@ from unittest.mock import Mock, patch
 
 APP = Path(__file__).resolve().parents[1] / "app"
 FLAG = "SURVIVOR_LIVE_TRADING"
+
+
+def confirmed_cancel(sdk):
+    row = dict(orderId="mock-order", orderStatus="PENDING", securityId="23",
+               exchangeSegment="NSE_EQ", productType="INTRADAY", transactionType="BUY",
+               quantity=5, filledQty=0)
+    sdk.get_order_list.side_effect = lambda: {"status": "success", "data": [row.copy()]}
+    sdk.get_order_by_id.side_effect = lambda oid: {"status": "success", "data": row.copy()}
+
+    def cancel(oid):
+        assert oid == row["orderId"]
+        row["orderStatus"] = "CANCELLED"
+        return {"status": "success", "data": {"orderId": oid}}
+
+    sdk.cancel_order.side_effect = cancel
+    return row
 
 
 class WriteSafetyTests(unittest.TestCase):
@@ -162,8 +179,16 @@ class WriteSafetyTests(unittest.TestCase):
         self.assert_flatten_denied(flag="0", live=True)
 
     def test_authorized_flatten(self):
-        self.run_flatten(flag="1", live=True)
-        self.sdk.dhanhq.return_value.cancel_order.assert_called_once_with("mock-order")
+        sdk = self.sdk.dhanhq.return_value
+        row = confirmed_cancel(sdk)
+        with tempfile.TemporaryDirectory() as directory:
+            staged = Path(directory) / "survivor_engine.py"
+            staged.write_bytes((APP / staged.name).read_bytes())
+            with patch.dict(os.environ, {FLAG: "1"}), patch.object(
+                    sys, "argv", [str(staged), "flatten", "--live"]):
+                runpy.run_path(str(staged), run_name="__main__")
+        sdk.cancel_order.assert_called_once_with("mock-order")
+        self.assertEqual(row["orderStatus"], "CANCELLED")
 
     def run_premarket(self, *, policy=None):
         sdk = self.sdk.dhanhq.return_value

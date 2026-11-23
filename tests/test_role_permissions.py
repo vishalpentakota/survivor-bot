@@ -18,8 +18,13 @@ class RolePermissionsTests(unittest.TestCase):
         engine = self.engine
         state = {"status": "ALIVE", "mortality_armed": True, "peak_equity": 30000,
                  "active_trade": {"order_id": "mock-order"}}
-        before = deepcopy(state)
+        authorized = live and flag == "1"
         sdk = self.sdk.dhanhq.return_value
+        if authorized:
+            # The account has a working orphan entry, with no active trade to finalize.
+            state["active_trade"] = None
+            row = fixtures.confirmed_cancel(sdk)
+        before = deepcopy(state)
         with tempfile.TemporaryDirectory(dir=fixtures.APP.parent) as directory:
             obituary = Path(directory) / "obituary"
             with (
@@ -27,6 +32,8 @@ class RolePermissionsTests(unittest.TestCase):
                 patch.object(engine, "save_state") as save,
                 patch.object(engine, "load_journal", return_value=[]),
                 patch.object(engine, "OBITUARY_FILE", str(obituary)),
+                patch.object(engine, "EXIT_LEDGER", Path(directory) / "exit.json"),
+                patch.object(engine.time, "sleep"),
                 patch.object(engine, "acquire_engine_lock", return_value=9) as acquire,
                 patch.object(engine, "release_engine_lock"),
                 patch.object(engine.SurvivorDhanClient, "get_live_equity_and_positions", autospec=True,
@@ -36,9 +43,11 @@ class RolePermissionsTests(unittest.TestCase):
                 if role == "status":
                     engine.cmd_status()
                 else:
-                    engine.cmd_tick(live=live)
-            if live and flag == "1":
+                    result = engine.cmd_tick(live=live)
+            if authorized:
+                self.assertEqual(result, 0)
                 sdk.cancel_order.assert_called_once_with("mock-order")
+                self.assertEqual(row["orderStatus"], "CANCELLED")
                 self.assertEqual(save.call_args.args[0]["status"], "DEAD_COMA")
                 self.assertTrue(obituary.exists())
             else:
