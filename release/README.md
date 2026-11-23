@@ -79,12 +79,11 @@ port, the quote incident, the option chase fix and token publication after
 persistence. Unreviewed scopes still block the gate. The [source review
 diagnostic](source-review-diagnostic.md) lists their exact names.
 
-The standalone `cloud_probe.py` constructor change maps to `e67e554` and
-has checkout-only CLI evidence in `test_cloud_probe_cli.py`. The application
-probe is outside both archives, while the candidate export includes its
-test file. Executing those cases requires a source checkout containing
-the probe. The exported suite and rollback exercise were outside this
-source-only diagnostic. The focused checkout run is recorded in
+The candidate source archive supports the standalone read-only
+`app/cloud_probe.py` and includes `tests/test_cloud_probe_cli.py`. The
+stubbed CLI tests cover the default public IP lookup, cache-only broker
+reads, and refusal when the token cache is unavailable. The constructor
+change maps to `e67e554`. The focused checkout run is recorded in
 [operator regressions](operator-regressions.md).
 
 The mixed guard declarations, token cache and refresh paths, and engine

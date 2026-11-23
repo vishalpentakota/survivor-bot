@@ -89,7 +89,7 @@ def write_bundle(output, kind, sources):
     return manifest
 
 
-CANDIDATE_MODULES = ("cloud_guard", "dhan_broker", "survivor_engine", *ADDED_MODULES)
+CANDIDATE_MODULES = ("cloud_guard", "cloud_probe", "dhan_broker", "survivor_engine", *ADDED_MODULES)
 ROLLBACK_MODULES = ("cloud_guard", "dhan_broker", "survivor_engine")
 HARNESS = ("offline.py", "rollback_preflight.py", "requirements-offline.txt", "README.md")
 LOCAL_PYTHON = DEPLOYED / ".venv/bin/python"
@@ -123,7 +123,7 @@ def compare(candidate, baseline):
             change = "added" if before is None else "removed" if after is None else "modified"
             record.update(change=change, classification="unreviewed",
                           reason="No approval recorded for this exact source delta")
-            if module in {"risk_manager", "cloud_probe"}:
+            if module == "risk_manager":
                 record["reason"] += "; module excluded from both supported bundles"
         drift[name] = record
     return drift
