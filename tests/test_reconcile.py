@@ -2,6 +2,8 @@
 from contextlib import redirect_stdout
 from io import StringIO
 import json
+import os
+import sys
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -151,6 +153,121 @@ class Reconcile(TestCase):
         self.assertEqual(self.report()[0], 0)
         self.assertEqual(self.journal(), rows)
         self.assertEqual(self.state()["actual_broker_charges_total"], 10)
+
+    def exit_route(self, route, state):
+        if route == "MANUAL_EMERGENCY_EXIT":
+            with patch.object(sys, "argv", ["survivor_engine.py", "flatten", "--live"]), \
+                    patch.dict(os.environ, {"SURVIVOR_LIVE_TRADING": "1"}):
+                try:
+                    return self.engine.main() or 0
+                except SystemExit as exc:
+                    return exc.code
+        return self.engine._flatten_trade(self.client(), state, state["active_trade"], route)
+
+    def test_net_after_fees_and_late_actual_charges_by_exit_route(self):
+        self.configure_persistence()
+        self.enterContext(patch.object(self.engine, "BASE_DIR", self.engine.EXIT_LEDGER.parent))
+        for route in ("EOD_SQUARE_OFF", "STOP_LOSS_HIT", "HALT_FLATTENED", "MANUAL_EMERGENCY_EXIT"):
+            for exit_price, gross, net in ((101, 5, -50), (120, 100, 45)):
+                with self.subTest(route=route, exit_price=exit_price):
+                    self.initialize("absent")
+                    self.sdk.get_fund_limits.return_value = self.response(
+                        {"availabelBalance": 23500.18, "utilizedAmount": 0})
+                    losing = net < 0
+                    stop = route == "STOP_LOSS_HIT"
+                    active = self.active(entry_cycle="confirmed-workflow",
+                                         sl_order_id="stop" if stop else None)
+                    before = dict(self.state(), active_trade=active, daily_halted=False)
+                    self.write_state(before)
+
+                    # Even a flat position cannot establish the closing fill.
+                    self.set_position(0)
+                    self.assertNotEqual(self.exit_route(route, self.engine.load_state()), 0)
+                    self.assertEqual(self.journal(), [])
+                    for key in ("losses", "wins", "total_trades", "daily_consecutive_losses",
+                                "daily_halted", "realized_pnl_total"):
+                        self.assertEqual(self.state()[key], before[key])
+                    self.sdk.place_order.assert_not_called()
+
+                    exit_id = "stop" if stop else "2"
+                    if stop:
+                        self.rows[exit_id] = self.row(exit_id, "SELL", "TRADED", 5, 5, exit_price)
+                    else:
+                        self.set_position(5)
+                        self.exit_submit(self.rows, iter([("TRADED", 5, 0)]))
+                        submit = self.sdk.place_order.side_effect
+
+                        def fill_exit(**kwargs):
+                            response = submit(**kwargs)
+                            self.rows[exit_id]["averageTradedPrice"] = exit_price
+                            return response
+
+                        self.sdk.place_order.side_effect = fill_exit
+
+                    self.assertEqual(self.exit_route(route, self.engine.load_state()), 0)
+                    row, = self.journal()
+                    self.assertEqual(row["exit_trigger"], route)
+                    self.assertEqual(row["exit_reason"], "EXCHANGE_SL_FILLED" if stop else route)
+                    self.assertEqual([item["id"] for item in row["exit_proof"]["exits"]], [exit_id])
+                    self.assertEqual((row["gross_pnl"], row["net_pnl"],
+                                      row["estimated_roundtrip_charges"]), (gross, net, 55))
+                    self.assertEqual((row["pnl_provenance"], row["actual_broker_charges"]),
+                                     ("estimated_roundtrip", None))
+                    self.assertTrue(row["fills_verified"])
+                    self.assertFalse(row["reconciled_with_broker"])
+                    scored = self.state()
+                    self.assertIsNone(scored["active_trade"])
+                    self.assertEqual((scored["losses"], scored["wins"], scored["total_trades"],
+                                      scored["daily_consecutive_losses"], scored["daily_halted"],
+                                      scored["realized_pnl_total"]),
+                                     (7 + losing, 4 + (not losing), 12, 2 if losing else 0,
+                                      losing, 400 + net))
+                    self.assertEqual(len(scored["applied_exit_proofs"]), 1)
+                    self.assertEqual(scored["realized_pnl_total_provenance"],
+                                     "includes_estimated_roundtrip")
+                    if losing:
+                        self.assertIn("2 consecutive losses", scored["daily_halt_reason"])
+                    else:
+                        self.assertEqual(scored["daily_halt_reason"], "")
+
+                    # Each reconciliation reloads the persisted state and constructs a client.
+                    self.sdk.reset_mock()
+                    status, output = self.report()
+                    self.assertEqual(status, 1, output)
+                    self.assertNotIn("Actual broker charges:", output)
+                    self.assertEqual(self.state()["actual_broker_charges_total"], 0)
+                    self.assertEqual(self.state()["actual_realized_pnl_total"], 0)
+                    self.assertEqual(self.journal(), [row])
+
+                    # Actual charges yield +2 on the estimated-loss trade.
+                    self.rows["entry"]["brokerageAndStatutoryCharges"] = 1
+                    self.rows[exit_id]["brokerageAndStatutoryCharges"] = 2
+                    for _ in range(2):
+                        status, output = self.report()
+                        self.assertEqual(status, 0, output)
+                        self.assertIn("Actual broker charges: ₹3.00", output)
+                        actual, = self.journal()
+                        self.assertTrue(actual["reconciled_with_broker"])
+                        self.assertEqual(actual["pnl_provenance"], "broker_actual")
+                        self.assertEqual(actual["actual_broker_charges"], 3)
+                        self.assertEqual(actual["net_pnl"], gross - 3)
+                        for key in ("trade_no", "exit_time", "exit_trigger", "gross_pnl"):
+                            self.assertEqual(actual[key], row[key])
+                        expected_proof = dict(row["exit_proof"],
+                            entry=dict(row["exit_proof"]["entry"], broker_charge=1),
+                            exits=[dict(row["exit_proof"]["exits"][0], broker_charge=2)])
+                        self.assertEqual(actual["exit_proof"], expected_proof)
+                        after = self.state()
+                        self.assertEqual(after["actual_broker_charges_total"], 3)
+                        self.assertEqual(after["actual_realized_pnl_total"], gross - 3)
+                        for key in ("losses", "wins", "total_trades", "daily_consecutive_losses",
+                                    "daily_halted", "daily_halt_reason", "applied_exit_proofs",
+                                    "realized_pnl_total", "realized_pnl_total_provenance",
+                                    "active_trade"):
+                            self.assertEqual(after[key], scored[key])
+                    self.sdk.place_order.assert_not_called()
+                    self.sdk.modify_order.assert_not_called()
+                    self.sdk.cancel_order.assert_not_called()
 
     def test_estimated_net_applies_strategy_risk_without_actual_pnl(self):
         self.stage()
