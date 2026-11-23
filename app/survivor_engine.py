@@ -2012,15 +2012,11 @@ def _finalize_closed_trade(client: Optional[SurvivorDhanClient], state: Dict, ac
             apply_risk = closed is not None and identity not in applied
             if apply_risk:
                 verified = [row for row in journal if _journal_proof(row)]
-                if closed.get("actual_broker_charges") is not None:
-                    actual = _actual_rows(verified)
-                    _apply_exit_risk(updated, closed, actual)
-                    _save_actual_totals(updated, actual)
-                elif not closed.get("entry_cycle"):
-                    # Pre-workflow positions retain the projected legacy risk counters.
-                    # Actual accounting only consumes fee-backed immutable proofs.
-                    _apply_exit_risk(updated, closed, verified)
+                _apply_exit_risk(updated, closed, verified)
+                if closed.get("actual_broker_charges") is None:
                     updated["realized_pnl_total_provenance"] = "includes_estimated_roundtrip"
+                else:
+                    _save_actual_totals(updated, _actual_rows(verified))
                 updated["applied_exit_proofs"] = [*applied, identity]
             updated["active_trade"] = None
             if emergency:

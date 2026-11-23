@@ -24,11 +24,12 @@ class Reconcile(TestCase):
     state = fixtures.RestartMatrix.state
     journal = fixtures.RestartMatrix.journal
     write_state = fixtures.RestartMatrix.write_state
+    restart = fixtures.RestartMatrix.restart
 
     def stage(self):
         self.configure_persistence()
         self.initialize("absent")
-        self.write_state(dict(self.state(), active_trade=None))
+        self.write_state(dict(self.state(), active_trade=None, daily_halted=False))
         self.enterContext(patch.object(self.engine, "BASE_DIR", self.engine.EXIT_LEDGER.parent))
         self.sdk.get_fund_limits.return_value = self.response(
             {"availabelBalance": 23500.18, "utilizedAmount": 0})
@@ -83,6 +84,10 @@ class Reconcile(TestCase):
         self.assertEqual(self.engine._flatten_trade(self.client(), state, active, "HALT_FLATTENED"), 1)
         self.assertEqual(self.journal(), old)
         self.assertIsNotNone(self.state()["active_trade"])
+        after = self.state()
+        for key in ("losses", "daily_consecutive_losses", "total_trades", "realized_pnl_total",
+                    "daily_halted", "applied_exit_proofs"):
+            self.assertEqual(after.get(key), state.get(key))
         self.assertEqual(self.report()[0], 1)
         with self.engine._eod_store().transaction() as db:
             messages = db.execute("SELECT message FROM incidents").fetchall()
@@ -147,7 +152,7 @@ class Reconcile(TestCase):
         self.assertEqual(self.journal(), rows)
         self.assertEqual(self.state()["actual_broker_charges_total"], 10)
 
-    def test_estimated_net_does_not_apply_strategy_risk_or_actual_pnl(self):
+    def test_estimated_net_applies_strategy_risk_without_actual_pnl(self):
         self.stage()
         active = self.active(sl_order_id="stop", entry_cycle="confirmed-workflow")
         self.book({
@@ -163,13 +168,96 @@ class Reconcile(TestCase):
         self.assertTrue(row["fills_verified"])
         self.assertFalse(row["reconciled_with_broker"])
         after = self.state()
-        for key in ("losses", "daily_consecutive_losses", "realized_pnl_total", "daily_halted"):
-            self.assertEqual(before.get(key), after.get(key))
+        self.assertEqual(row["net_pnl"], -50)
+        self.assertEqual(after["losses"], before["losses"] + 1)
+        self.assertEqual(after["daily_consecutive_losses"], before["daily_consecutive_losses"] + 1)
+        self.assertEqual(after["total_trades"], before["total_trades"] + 1)
+        self.assertEqual(after["realized_pnl_total"], before["realized_pnl_total"] - 50)
+        self.assertEqual(after["realized_pnl_total_provenance"], "includes_estimated_roundtrip")
+        self.assertTrue(after["daily_halted"])
         status, output = self.report()
         self.assertEqual(status, 1)
         self.assertIn("Estimated roundtrip charges per trade: ₹55.00", output)
         self.assertNotIn("Actual broker charges:", output)
+        self.assertNotIn("Verified net P&L:", output)
         self.assertEqual(self.state()["actual_realized_pnl_total"], 0)
+
+    def close_without_itemized_charges(self, exit_price, *, order_id="entry",
+                                       stop_id="stop", entry_time="2026-11-23T10:00:00+05:30"):
+        active = self.active(order_id=order_id, sl_order_id=stop_id, entry_time=entry_time,
+                             entry_cycle="confirmed-workflow")
+        self.book({
+            order_id: self.row(order_id, "BUY", "TRADED", 5, 5, 100),
+            stop_id: self.row(stop_id, "SELL", "TRADED", 5, 5, exit_price),
+        })
+        state = dict(self.state(), active_trade=active)
+        self.write_state(state)
+        self.assertEqual(self.engine._flatten_trade(self.client(), state, active, "STOP_LOSS_HIT"), 0)
+
+    def test_confirmed_stop_without_itemized_charges_halts_after_two_losses(self):
+        self.stage()
+        before = dict(self.state(), mortality_armed=True)
+        self.assertEqual(before["daily_consecutive_losses"], 1)
+        self.write_state(before)
+        self.close_without_itemized_charges(90)
+        row, = self.journal()
+        self.assertEqual((row["exit_reason"], row["gross_pnl"], row["net_pnl"]),
+                         ("EXCHANGE_SL_FILLED", -50, -105))
+        self.assertEqual((row["pnl_provenance"], row["actual_broker_charges"],
+                          row["reconciled_with_broker"], row["fills_verified"]),
+                         ("estimated_roundtrip", None, False, True))
+        after = self.state()
+        self.assertEqual((after["losses"], after["daily_consecutive_losses"],
+                          after["total_trades"], after["realized_pnl_total"]),
+                         (8, 2, 12, 295))
+        self.assertIsNone(after["active_trade"])
+        self.assertEqual(len(after["applied_exit_proofs"]), 1)
+        self.assertTrue(after["daily_halted"])
+        self.assertIn("2 consecutive losses", after["daily_halt_reason"])
+        self.assertEqual(after["last_sl_direction"], "LONG")
+        self.assertEqual(after["last_sl_time"], row["exit_time"])
+        self.assertIsNone(after.get("actual_broker_charges_total"))
+        self.assertIsNone(after.get("actual_realized_pnl_total"))
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertIsNone(self.restart())
+        self.assertIn("Daily halt active: 2 consecutive losses", output.getvalue())
+        restarted = self.state()
+        for key in ("losses", "daily_consecutive_losses", "total_trades", "realized_pnl_total",
+                    "daily_halted", "daily_halt_reason", "applied_exit_proofs"):
+            self.assertEqual(restarted[key], after[key])
+        self.assertEqual(self.journal(), [row])
+        self.sdk.place_order.assert_not_called()
+        self.sdk.modify_order.assert_not_called()
+        self.sdk.cancel_order.assert_not_called()
+
+    def test_estimated_gross_loss_triggers_green_floor_after_banked_gain(self):
+        self.stage()
+        self.close_without_itemized_charges(
+            220, order_id="earlier", stop_id="earlier-stop",
+            entry_time="2026-11-23T09:30:00+05:30")
+        self.assertEqual(self.journal()[0]["net_pnl"], 545)
+        self.assertEqual(self.state()["daily_consecutive_losses"], 0)
+        self.assertFalse(self.state()["daily_halted"])
+
+        self.close_without_itemized_charges(90)
+        after = self.state()
+        self.assertEqual([row["net_pnl"] for row in self.journal()], [545, -105])
+        self.assertEqual(after["daily_consecutive_losses"], 1)
+        self.assertTrue(after["daily_halted"])
+        self.assertIn("Green floor", after["daily_halt_reason"])
+
+    def test_estimated_net_triggers_green_target(self):
+        self.stage()
+        self.close_without_itemized_charges(412)
+        row, = self.journal()
+        self.assertEqual((row["gross_pnl"], row["net_pnl"], row["pnl_provenance"]),
+                         (1560, 1505, "estimated_roundtrip"))
+        after = self.state()
+        self.assertEqual((after["wins"], after["total_trades"], after["daily_consecutive_losses"]),
+                         (5, 12, 0))
+        self.assertTrue(after["daily_halted"])
+        self.assertIn("Green Target Banked", after["daily_halt_reason"])
 
     def test_actual_fee_contradiction_fences_replay(self):
         self.stage()
