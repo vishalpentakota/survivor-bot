@@ -1533,7 +1533,7 @@ def _start_entry(client, state, trade, side, order_type, price):
     if quantity <= 0 or not math.isfinite(price) or not math.isfinite(trade["stop_loss"]):
         return "idle"
     limit = round_tick(price, tick)
-    if order_type == client.dhan.LIMIT and limit <= 0:
+    if order_type == "LIMIT" and limit <= 0:
         return "idle"
     trigger = trade.pop("stop_loss")
     workflow = {"trade": trade, "trigger": trigger, "limit": limit}
@@ -1552,7 +1552,7 @@ def _start_entry(client, state, trade, side, order_type, price):
 def _entry_chase(client, coordinator, work, pending, oid, book, exposure):
     trade = work["trade"]
     limit = work["limit"]
-    if pending["requested_type"] != client.dhan.LIMIT or pending["side"] != "BUY":
+    if pending["requested_type"] != "LIMIT" or pending["side"] != "BUY":
         return False
     security = str(trade["security_id"])
     exchange = trade["exchange_segment"]
@@ -1997,18 +1997,6 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
         if hhmm >= "15:10":
             return _flatten_trade(client, state, active, "EOD_SQUARE_OFF")
 
-        verified_stop = active.get("sl_order_id")
-        _ts = active.get("tick_size") or _get_tick_size(sec_id, exch)
-        if active.get("entry_cycle") and not verified_stop:
-            return _flatten_trade(client, state, active, "UNPROTECTED_POSITION_EXIT")
-        if verified_stop:
-            status = _inspect_active_stop(client, state, active, _ts)
-            if status == "UNKNOWN":
-                return 1
-            if status != "RESTING":
-                return _flatten_trade(client, state, active,
-                                      "EXCHANGE_SL_FILLED" if status == "TRADED" else "PROTECTION_EXIT")
-
         # 2. Check if Exchange SL order already closed the position on Dhan
         #    P1 fail-closed: only a VERIFIED success response may be interpreted;
         #    unknown position state never finalizes a trade.
@@ -2029,6 +2017,18 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
                 open_sec_ids = {str(p.get("securityId")) for p in positions if int(p.get("netQty", 0)) != 0}
                 if sec_id not in open_sec_ids:
                     return _flatten_trade(client, state, active, "POSITION_ABSENT")
+
+        verified_stop = active.get("sl_order_id")
+        _ts = active.get("tick_size") or _get_tick_size(sec_id, exch)
+        if active.get("entry_cycle") and not verified_stop:
+            return _flatten_trade(client, state, active, "UNPROTECTED_POSITION_EXIT")
+        if verified_stop:
+            status = _inspect_active_stop(client, state, active, _ts)
+            if status == "UNKNOWN":
+                return 1
+            if status != "RESTING":
+                return _flatten_trade(client, state, active,
+                                      "EXCHANGE_SL_FILLED" if status == "TRADED" else "PROTECTION_EXIT")
 
         # 3. Resolve current LTP: prefer the latest intraday tick, fall back to
         #    the 1-min candle close. The monitoring logic below runs on EVERY
