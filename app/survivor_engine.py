@@ -41,11 +41,12 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cloud_guard import LIVE_SWITCH, READ_ONLY, ReadOnlyBroker, RolePolicy, live_trading_enabled
 from dhan_broker import CachedTokenUnavailable, DhanTokenManager, load_env_file
+from entry_protection import alert as protection_alert, monitor_stop, recover as recover_entry, round_tick, stop_prices
 from eod_ownership import (
     EodStore, IST, LOCK_POLL_SECONDS, WINDOW_SECONDS, owner_record, publish_owner, scheduled_slot,
 )
 from verified_exit import (
-    ExitCoordinator, FlattenResult, TERMINAL, execution_evidence, fill as order_fill, instrument,
+    ExitCoordinator, FlattenResult, MutationBlocked, TERMINAL, execution_evidence, fill as order_fill, instrument,
     integer as broker_integer, locked as exit_lock, order_detail, persist as persist_exit_data, positions as verified_positions, same_execution,
 )
 
@@ -217,7 +218,7 @@ def _entry_window_open():
 
 
 def _exit_coordinator(client, *, budget=None):
-    return ExitCoordinator(client.dhan, EXIT_LEDGER, send_telegram, polls=FLATTEN_POLL_N,
+    return ExitCoordinator(client.dhan if client else None, EXIT_LEDGER, send_telegram, polls=FLATTEN_POLL_N,
                            interval=FLATTEN_POLL_S, deadline=EXIT_ESCALATION_SECONDS,
                            entry_allowed=_entry_window_open, budget=budget)
 
@@ -237,14 +238,6 @@ def _recovery_pending(client, active=None) -> bool:
         return True
 
 
-def _submit_entry(client, **params):
-    try:
-        return _exit_coordinator(client).enter(params)
-    except Exception:
-        logger.exception("Entry could not be verified")
-        return None
-
-
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -253,18 +246,25 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _get_tick_size(security_id: str, exchange_segment: str = "") -> float:
+def _instrument_metadata(security_id, exchange_segment):
+    # The original cache also accepts a bare tick value keyed by security ID.
     cache_file = os.path.join(BASE_DIR, ".tick_size_cache.json")
     try:
-        if os.path.exists(cache_file):
-            with open(cache_file) as f:
-                cache = json.load(f)
-            key = str(security_id)
-            if key in cache:
-                return float(cache[key])
-    except (json.JSONDecodeError, OSError, ValueError):
-        cache = {}
-    # Default NSE tick
+        with open(cache_file, encoding="utf-8") as storage:
+            cache = json.load(storage)
+        raw = cache.get(f"{exchange_segment}:{security_id}", cache.get(str(security_id), {}))
+        return raw if isinstance(raw, dict) else {"tick_size": raw}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _get_tick_size(security_id: str, exchange_segment: str = "") -> float:
+    try:
+        tick = float(_instrument_metadata(security_id, exchange_segment).get("tick_size", 0.05))
+        if math.isfinite(tick) and tick > 0:
+            return tick
+    except (TypeError, ValueError):
+        pass
     return 0.05
 
 
@@ -825,8 +825,12 @@ class SurvivorDhanClient:
             if ltp <= 12.0 or not sec_id or vol < 10000:
                 continue
 
-            lot_cost = ltp * lot_size
-            if lot_cost > max_lot_cost:
+            try:
+                contract_lot = broker_integer(leg.get("lot_size", lot_size))
+            except ValueError:
+                continue
+            lot_cost = ltp * contract_lot
+            if contract_lot <= 0 or lot_cost > max_lot_cost:
                 continue
 
             # Delta sweet spot: 0.35 to 0.60 (avoids rapid OTM theta bleed while staying affordable)
@@ -850,7 +854,8 @@ class SurvivorDhanClient:
                 "ltp": ltp,
                 "bid": bid,
                 "ask": ask,
-                "lot_size": lot_size,
+                "lot_size": contract_lot,
+                "tick_size": leg.get("tick_size"),
                 "lot_cost": round(lot_cost, 2),
                 "delta": round(delta, 3),
                 "theta": round(theta, 2),
@@ -877,21 +882,15 @@ class SurvivorDhanClient:
                                   transaction_type: str, quantity: int,
                                   trigger_price: float, product_type: str = "INTRADAY") -> Dict:
         key = (str(security_id), exchange_segment, product_type)
+        if not self._policy.trade:
+            return {"placed": None, "rejected": False, "filled_qty": 0, "status": "UNKNOWN"}
         try:
-            for _ in range(ENTRY_SETTLE_TRIES):
-                if verified_positions(self.dhan).get(key):
-                    break
-                time.sleep(ENTRY_SETTLE_POLL_S)
             tick = _get_tick_size(security_id, exchange_segment)
-            trigger = round(round(trigger_price / tick) * tick, 2)
-            cushion = 0.98 if transaction_type == "SELL" else 1.02
-            price = round(round(trigger * cushion / tick) * tick, 2)
             return _exit_coordinator(self).protect(
-                key, transaction_type, quantity, {"price": price, "trigger_price": trigger})
+                key, transaction_type, quantity, stop_prices(trigger_price, tick, transaction_type))
         except Exception:
             logger.exception("Protective order could not be verified")
-            return {"placed": None, "rejected": True, "filled_qty": 0}
-
+            return {"placed": None, "rejected": False, "filled_qty": 0, "status": "UNKNOWN"}
 
 
 def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 2.0) -> Tuple[pd.Series, pd.Series]:
@@ -1522,89 +1521,108 @@ def cmd_status(live_Orders: bool = False, *, policy: Optional[RolePolicy] = None
     print("=" * 68)
 
 
-def _chase_unfilled_entry(client: "SurvivorDhanClient", trade_record: Dict,
-                          security_id: str, exchange_segment: str,
-                          instrument_type: str, original_limit: float) -> bool:
-    """
-    One-shot re-price chase for an unfilled entry LIMIT order (2026-11-20).
-    Window 1: poll the position book for the normal settle window. If the fill
-    has not confirmed (the market gapped away from the limit), fetch the fresh
-    LTP and re-price the order ONCE, never paying more than
-    original_limit * (1 + MAX_ENTRY_CHASE_PCT). A gap beyond the cap, a failed
-    modify, or a second unfilled window returns False -> the caller runs the
-    fail-closed abort (cancel pending order, no trade recorded).
-    """
-    def _filled() -> bool:
-        positions = _safe_get_positions(client)
-        if positions is None:
-            return False
-        for p in positions:
-            if str(p.get("securityId")) == str(security_id) and int(p.get("netQty", 0)) != 0:
-                return True
-        return False
-
-    for _ in range(ENTRY_SETTLE_TRIES):
-        time.sleep(ENTRY_SETTLE_POLL_S)
-        if _filled():
-            return True
-
-    # Fresh price: live tick first, 1-min candle close as fallback.
-    fresh = _get_latest_tick_ltp(client, security_id, exchange_segment, instrument_type)
-    if not fresh:
-        try:
-            df = client.fetch_candles(str(security_id), exchange_segment=exchange_segment,
-                                      instrument_type=instrument_type, days_back=1, resample_tf="1min")
-            fresh = float(df.iloc[-1]["close"]) if not df.empty else None
-        except Exception:
-            fresh = None
-    if not fresh or fresh <= original_limit:
-        # No price, or the market came back to our limit (the resting order is
-        # already marketable): do not touch the order.
-        return False
-
-    chase_cap = round(round(original_limit * (1.0 + MAX_ENTRY_CHASE_PCT) / 0.05) * 0.05, 2)
-    if fresh > chase_cap:
-        return False   # gap already beyond the slippage cap: never chase a runaway
-    new_limit = round(round(min(fresh * 1.005, chase_cap) / 0.05) * 0.05, 2)
-    if new_limit <= original_limit:
-        return False
-
+def _start_entry(client, state, trade, side, order_type, price):
+    if not client._policy.trade or state.get("active_trade"):
+        return "pending"
+    trade = trade.copy()
+    tick = float(trade["tick_size"])
+    lot = int(trade["lot_size"])
+    if not math.isfinite(tick) or tick <= 0 or lot <= 0:
+        return "pending"
+    quantity = trade["quantity"] // lot * lot
+    if quantity <= 0 or not math.isfinite(price) or not math.isfinite(trade["stop_loss"]):
+        return "idle"
+    limit = round_tick(price, tick)
+    if order_type == client.dhan.LIMIT and limit <= 0:
+        return "idle"
+    trigger = trade.pop("stop_loss")
+    workflow = {"trade": trade, "trigger": trigger, "limit": limit}
     try:
-        res = _exit_coordinator(client).modify(
-            str(trade_record["order_id"]), entry=True,
-            order_type=client.dhan.LIMIT,
-            leg_name="NA",
-            quantity=int(trade_record["quantity"]),
-            price=new_limit,
-            trigger_price=0,
-            disclosed_quantity=0,
-            validity="DAY",
-        )
-        if not isinstance(res, dict) or res.get("status") != "success":
-            return False
-    except Exception as e:
-        logger.warning(f"Entry chase modify failed for order {trade_record.get('order_id')}: {e}")
-        return False
-    print(f"\U0001F501 [ENTRY CHASE] {trade_record.get('symbol')} unfilled at \u20B9{original_limit}; re-priced once to \u20B9{new_limit} (slippage cap \u20B9{chase_cap}).")
-
-    # Window 2: one more settle window for the re-priced order.
-    for _ in range(ENTRY_SETTLE_TRIES):
-        time.sleep(ENTRY_SETTLE_POLL_S)
-        if _filled():
-            return True
-
-    # Anti-race: if the order actually traded in the last instant, treat it as
-    # filled so the caller places the protective SL instead of aborting.
-    try:
-        st = client.dhan.get_order_by_id(trade_record.get("order_id"))
-        d = st.get("data") if isinstance(st, dict) else None
-        if isinstance(d, list) and d:
-            d = d[0]
-        if (d if isinstance(d, dict) else {}).get("orderStatus") == "TRADED":
-            return True
+        _exit_coordinator(client).enter({
+            "security_id": trade["security_id"], "exchange_segment": trade["exchange_segment"],
+            "transaction_type": side, "quantity": quantity, "order_type": order_type,
+            "product_type": client.dhan.INTRA, "price": workflow["limit"],
+        }, workflow=workflow)
     except Exception:
-        pass
-    return False
+        logger.exception("Entry submission unresolved")
+        return "pending"
+    return _resume_entry(client, state)
+
+
+def _entry_chase(client, coordinator, work, pending, oid, book, exposure):
+    trade = work["trade"]
+    limit = work["limit"]
+    if pending["requested_type"] != client.dhan.LIMIT or pending["side"] != "BUY":
+        return False
+    security = str(trade["security_id"])
+    exchange = trade["exchange_segment"]
+    instrument_type = trade["instrument_type"]
+    fresh = _get_latest_tick_ltp(client, security, exchange, instrument_type)
+    if not fresh:
+        frame = client.fetch_candles(security, exchange_segment=exchange, instrument_type=instrument_type,
+                                     days_back=1, resample_tf="1min")
+        fresh = float(frame.iloc[-1]["close"]) if not frame.empty else None
+    tick = trade["tick_size"]
+    cap = round_tick(limit * (1 + MAX_ENTRY_CHASE_PCT), tick, floor=True)
+    if not fresh or not limit < fresh <= cap:
+        return False
+    price = min(cap, round_tick(fresh * 1.005, tick))
+    if price <= limit or coordinator.snapshot() != (book, exposure):
+        return False
+    try:
+        coordinator.check_entry_allowed()
+    except MutationBlocked:
+        return False
+    client.dhan.modify_order(order_id=oid, order_type=client.dhan.LIMIT, leg_name="NA",
+                             quantity=pending["quantity"], price=price, trigger_price=0,
+                             disclosed_quantity=0, validity="DAY")
+    return True
+
+
+def _resume_entry(client, state):
+    coordinator = _exit_coordinator(client)
+
+    def publish(trade):
+        current = state.get("active_trade")
+        if current:
+            if current.get("entry_cycle") != trade["entry_cycle"]:
+                raise ValueError("Entry recovery conflicts with active trade")
+        updated = dict(state, active_trade={**(current or {}), **trade})
+        if updated["active_trade"] == current:
+            return
+        day = datetime.now(IST).date().isoformat()
+        if not current and trade["entry_time"][:10] == day:
+            updated["daily_trades_count"] = updated.get("daily_trades_count", 0) + 1
+        save_state(updated)
+        state.update(updated)
+
+    try:
+        return recover_entry(
+            coordinator, publish,
+            lambda work, pending, oid, book, exposure: _entry_chase(
+                client, coordinator, work, pending, oid, book, exposure),
+            polls=ENTRY_SETTLE_TRIES, interval=ENTRY_SETTLE_POLL_S,
+            allow_protection=lambda: (
+                datetime.now(IST).strftime("%H:%M") < "15:10"
+                and state["status"] != "DEAD_COMA" and not state.get("daily_halted")
+            ),
+        )
+    except Exception:
+        logger.exception("Entry/protection recovery could not be verified")
+        return "pending"
+
+
+def _entry_tick_result(client, state, outcome, quiet_scan):
+    if datetime.now(IST).strftime("%H:%M") >= "15:10":
+        return _flatten_trade(client, state, state.get("active_trade"), "EOD_SQUARE_OFF")
+    if outcome == "close":
+        return _flatten_trade(client, state, state["active_trade"], "UNPROTECTED_POSITION_EXIT")
+    if outcome == "ready":
+        active = state["active_trade"]
+        print(f"Entered {active['quantity']}x {active['symbol']} @ ₹{active['entry_price']} | "
+              f"Verified exchange SL ₹{active['stop_loss']} (Order {active['sl_order_id']})")
+        return monitor_active_trade_loop(client, state, max_seconds=250, quiet_scan=quiet_scan)
+    return int(outcome == "pending")
 
 
 def _today_entries(journal: list, setup: str = None, direction: str = None, security_id=None) -> list:
@@ -1688,7 +1706,8 @@ def _verified_trade_fills(client, ledger, active, *, settle=True, claimed=()):
     entry_id = str(active["order_id"])
     sec_id = str(active["security_id"])
     exchange = active["exchange_segment"]
-    entry_side = "BUY" if active["weapon"] == "OPTIONS" or active["direction"] == "LONG" else "SELL"
+    entry_side = active.get("entry_side") or (
+        "BUY" if active["weapon"] == "OPTIONS" or active["direction"] == "LONG" else "SELL")
     exit_side = "SELL" if entry_side == "BUY" else "BUY"
     coordinator = _exit_coordinator(client)
     closure = coordinator.closure(ledger, settle=settle)
@@ -1718,6 +1737,8 @@ def _verified_trade_fills(client, ledger, active, *, settle=True, claimed=()):
     next_entry = min(later_entries, default=None)
     executions = []
     sources = set()
+    stop_ids = {str(order_id) for order_id in (active.get("sl_order_id"), active.get("stop_execution_id"))
+                if order_id is not None}
     for oid, row in book.items():
         if row.get("transactionType") != exit_side or row.get("orderStatus") not in TERMINAL:
             continue
@@ -1726,7 +1747,7 @@ def _verified_trade_fills(client, ledger, active, *, settle=True, claimed=()):
         # A broker timestamp scopes ledger fills to this entry when an instrument
         # has been traded repeatedly. Legacy stops have an explicit order ID.
         exit_time = row.get("createTime")
-        identified = oid == str(active.get("sl_order_id"))
+        identified = oid in stop_ids
         if entry_time and exit_time:
             in_trade = exit_time >= entry_time and (next_entry is None or exit_time < next_entry)
             identified = in_trade and (identified or oid in exits and exit_time > entry_time)
@@ -1742,7 +1763,7 @@ def _verified_trade_fills(client, ledger, active, *, settle=True, claimed=()):
             executions.append(execution_evidence(oid, row))
             recorded = exits.get(oid)
             source = recorded.get("source", "UNKNOWN") if isinstance(recorded, dict) else "UNKNOWN"
-            if oid == str(active.get("sl_order_id")) or row.get("orderType") in {"STOP_LOSS", "STOP_LOSS_MARKET"}:
+            if oid in stop_ids or row.get("orderType") in {"STOP_LOSS", "STOP_LOSS_MARKET"}:
                 source = "EXCHANGE_STOP"
             elif source == "UNKNOWN" and row.get("orderType") == "MARKET":
                 source = "MARKET"
@@ -1813,6 +1834,7 @@ def _finalize_closed_trade(client: Optional[SurvivorDhanClient], state: Dict, ac
                     proof = fresh
                     qty, entry_px, exit_px, gross, net = _closure_amounts(proof)
                     closed = active.copy()
+                    closed.pop("stop_amendment", None)
                     now = datetime.now(IST).isoformat()
                     trigger = "POSITION_ABSENT" if reason == "EXCHANGE_SL_FILLED" else reason
                     exit_reason = "EXCHANGE_SL_FILLED" if source == "EXCHANGE_STOP" else trigger
@@ -1933,6 +1955,15 @@ def _flatten_trade(client, state, active, reason):
     return 0 if result.flat else 1
 
 
+def _inspect_active_stop(client, state, active, tick, *, trigger=None):
+    try:
+        return monitor_stop(_exit_coordinator(client), active, lambda: save_state(state),
+                            tick=tick, trigger=trigger)
+    except Exception:
+        logger.exception("Active stop recovery could not be verified")
+        return "UNKNOWN"
+
+
 def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: bool = True, max_seconds: int = 260, quiet_scan: bool = False) -> Optional[int]:
     """
     In-Trade 5-Second Live Monitor Loop:
@@ -1965,6 +1996,18 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
         # 1. Mandatory EOD check inside the 5s loop
         if hhmm >= "15:10":
             return _flatten_trade(client, state, active, "EOD_SQUARE_OFF")
+
+        verified_stop = active.get("sl_order_id")
+        _ts = active.get("tick_size") or _get_tick_size(sec_id, exch)
+        if active.get("entry_cycle") and not verified_stop:
+            return _flatten_trade(client, state, active, "UNPROTECTED_POSITION_EXIT")
+        if verified_stop:
+            status = _inspect_active_stop(client, state, active, _ts)
+            if status == "UNKNOWN":
+                return 1
+            if status != "RESTING":
+                return _flatten_trade(client, state, active,
+                                      "EXCHANGE_SL_FILLED" if status == "TRADED" else "PROTECTION_EXIT")
 
         # 2. Check if Exchange SL order already closed the position on Dhan
         #    P1 fail-closed: only a VERIFIED success response may be interpreted;
@@ -2009,9 +2052,9 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
         except Exception:
             held_mins = 0.0
 
-        _ts = _get_tick_size(sec_id, exch)
+        new_sl = float(active["stop_loss"])
 
-        if active["weapon"] == "OPTIONS" or direction == "LONG":
+        if active.get("entry_side", "BUY" if active["weapon"] == "OPTIONS" or direction == "LONG" else "SELL") == "BUY":
             pts_gain = curr_ltp - entry_px
             peak_pts = max(float(active.get("peak_pts_gain", 0.0)), pts_gain)
             active["peak_pts_gain"] = round(peak_pts, 2)
@@ -2030,46 +2073,17 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
                 # P9: equity LONG going nowhere exits after EQUITY_STALE_MINS
                 stale_kill = (held_mins >= EQUITY_STALE_MINS and pts_gain <= 0)
 
-            # PROFIT LOCK RATCHET (peak-based, three tiers). A trade that was
-            # meaningfully green must NEVER close red (fix 2026-11-20).
-            new_sl = float(active["stop_loss"])
             if active["weapon"] == "OPTIONS":
                 if peak_pts >= 8.0:
-                    new_sl = max(new_sl, round(round((entry_px + peak_pts * 0.65) / _ts) * _ts, 2))
+                    new_sl = max(new_sl, round_tick(entry_px + peak_pts * 0.65, _ts))
                 elif peak_pts >= 4.0:
-                    new_sl = max(new_sl, round(round((entry_px + 2.00) / _ts) * _ts, 2))
+                    new_sl = max(new_sl, round_tick(entry_px + 2.00, _ts))
                 elif peak_pts >= 2.0:
-                    new_sl = max(new_sl, round(round((entry_px + 0.50) / _ts) * _ts, 2))
-            else:
-                if peak_pts >= 3.0:
-                    new_sl = max(new_sl, round(round((entry_px + peak_pts * 0.50) / _ts) * _ts, 2))
-                elif peak_pts >= 1.5:
-                    new_sl = max(new_sl, round(round((entry_px + 0.30) / _ts) * _ts, 2))
-
-            if new_sl > float(active["stop_loss"]):
-                active["stop_loss"] = new_sl
-                save_state(state)
-                print(f"🔒 [PROFIT LOCK RATCHET] {active['symbol']} trailed Stop-Loss up to ₹{new_sl} (Peak gain: +{peak_pts:.1f} pts)")
-                if live and active.get("sl_order_id"):
-                    try:
-                        trig = round(round(new_sl / _ts) * _ts, 2)
-                        lim_px = round(round((trig * 0.98) / _ts) * _ts, 2)
-                        _exit_coordinator(client).modify(
-                            str(active["sl_order_id"]),
-                            order_type=client.dhan.SL,
-                            leg_name="NA",
-                            quantity=qty,
-                            price=lim_px,
-                            disclosed_quantity=0,
-                            trigger_price=trig,
-                            validity=client.dhan.DAY,
-                        )
-                    except Exception:
-                        pass
-            else:
-                # Persist peak_pts_gain every tick so it survives across monitor
-                # loops even when no ratchet threshold is crossed yet.
-                save_state(state)
+                    new_sl = max(new_sl, round_tick(entry_px + 0.50, _ts))
+            elif peak_pts >= 3.0:
+                new_sl = max(new_sl, round_tick(entry_px + peak_pts * 0.50, _ts))
+            elif peak_pts >= 1.5:
+                new_sl = max(new_sl, round_tick(entry_px + 0.30, _ts))
         else:
             pts_gain = entry_px - curr_ltp
             gross_pnl = pts_gain * qty
@@ -2079,11 +2093,21 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
             _stale_min = EQUITY_STALE_MINS if active.get("instrument_type") == "EQUITY" else 30.0
             stale_kill = (held_mins >= _stale_min and pts_gain <= 0)
             if pts_gain >= 0.45 * (entry_px - float(active["target_price"])):
-                active["stop_loss"] = min(float(active["stop_loss"]), round(entry_px * 0.996, 2))
+                new_sl = min(new_sl, round_tick(entry_px * 0.996, _ts))
 
         if hit_sl or hit_tp or stale_kill:
             reason = "TARGET_HIT" if hit_tp else ("STOP_LOSS_HIT" if hit_sl else "STALE_THETA_EXIT")
             return _flatten_trade(client, state, active, reason)
+
+        if verified_stop and new_sl != float(active["stop_loss"]):
+            status = _inspect_active_stop(client, state, active, _ts, trigger=new_sl)
+            if status == "SUBMITTED":
+                status = _inspect_active_stop(client, state, active, _ts)
+            if status == "UNKNOWN":
+                return 1
+            if status != "RESTING":
+                return _flatten_trade(client, state, active, "PROTECTION_EXIT")
+        save_state(state)
 
         time.sleep(MONITOR_POLL_S)
 
@@ -2155,14 +2179,24 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False,
         client = SurvivorDhanClient(policy=policy)
     except CachedTokenUnavailable as exc:
         print(f"🚨 TICK UNAVAILABLE — {exc}")
-        if live and active:
+        if live:
             try:
                 with exit_lock(EXIT_LEDGER) as ledger:
-                    if active.get("flatten_pending") or "replay_check" in ledger:
+                    cycle = ledger["cycle"]
+                    if cycle and (cycle.get("entry_workflow") or active and active.get("entry_cycle")):
+                        protection_alert(_exit_coordinator(None), ledger, cycle, cycle["id"] + ":broker",
+                                         "Broker unavailable. Entry or protection could not be confirmed.")
+                        return 1
+                    if active and (active.get("flatten_pending") or "replay_check" in ledger):
                         return 1
             except Exception:
                 return 1
         return None
+    if live:
+        outcome = _resume_entry(client, state)
+        if outcome not in {"idle", "ready"}:
+            return _entry_tick_result(client, state, outcome, quiet_scan)
+        active = state.get("active_trade")
     if live and (_recovery_pending(client, active) or active and active.get("flatten_pending")):
         return _flatten_trade(client, state, active, "RESTART_EXIT_RECOVERY")
     if state["status"] == "DEAD_COMA":
@@ -2381,15 +2415,20 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False,
                         save_state(state)
                     return
                 entry_px = opt["ltp"]
-                qty = opt["lot_size"]
+                meta = _instrument_metadata(opt["security_id"], "NSE_FNO")
+                try:
+                    qty = broker_integer(meta.get("lot_size", opt["lot_size"]))
+                    opt_tick = float(meta.get("tick_size", opt.get("tick_size") or 0.05))
+                    if qty <= 0 or not math.isfinite(opt_tick) or opt_tick <= 0:
+                        raise ValueError("Invalid option contract metadata")
+                except (TypeError, ValueError):
+                    return 1 if live else None
                 # Strict Guardrail Sizing: 8 to 10 pts max SL (~₹520-₹650 risk), 16 to 18 pts Quick Target (~+₹1,040 to +₹1,170)
                 max_pts_loss = min(10.0, entry_px * 0.10, tier["risk_per_trade_inr"] / qty)
                 max_pts_loss = max(7.5, max_pts_loss)
                 target_pts = round(max(15.0, max_pts_loss * 1.75), 2)
-                # Round all option prices to NSE ₹0.05 tick size
-                opt_tick = 0.05
-                sl_px = round(round((entry_px - max_pts_loss) / opt_tick) * opt_tick, 2)
-                tp_px = round(round((entry_px + target_pts) / opt_tick) * opt_tick, 2)
+                sl_px = round_tick(entry_px - max_pts_loss, opt_tick)
+                tp_px = round_tick(entry_px + target_pts, opt_tick)
 
                 trade_record = {
                     "weapon": "OPTIONS",
@@ -2402,6 +2441,8 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False,
                     "underlying_direction": idx_sig["signal"],
                     "underlying_index": best_idx_name,
                     "quantity": qty,
+                    "tick_size": opt_tick,
+                    "lot_size": qty,
                     "entry_price": entry_px,
                     "stop_loss": sl_px,
                     "target_price": tp_px,
@@ -2410,54 +2451,12 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False,
                     "live": live,
                 }
 
-                if live:
-                    # Round limit price to NSE ₹0.05 tick size
-                    raw_ask = opt["ask"] if opt["ask"] > 0 else entry_px
-                    entry_tick = 0.05
-                    limit_price = round(round(raw_ask / entry_tick) * entry_tick, 2)
-                    entry_id = _submit_entry(client,
-                        security_id=opt["security_id"],
-                        exchange_segment="NSE_FNO",
-                        transaction_type=client.dhan.BUY,
-                        quantity=qty,
-                        order_type=client.dhan.LIMIT,
-                        product_type=client.dhan.INTRA,
-                        price=limit_price,
-                    )
-                    if not entry_id:
-                        return _flatten_trade(client, state, None, "ENTRY_UNVERIFIED")
-                    trade_record["order_id"] = entry_id
-                    # 2026-11-20: one-shot re-price chase. If the option gapped away from
-                    # the limit inside the first settle window, re-price ONCE to the fresh
-                    # LTP (capped at +1.5% slippage); beyond the cap, or still unfilled,
-                    # the fail-closed abort below runs exactly as before.
-                    if not _chase_unfilled_entry(client, trade_record, str(opt["security_id"]),
-                                                 "NSE_FNO", "OPTIDX", float(limit_price)):
-                        return _flatten_trade(client, state, trade_record, "ENTRY_SETTLEMENT_EXIT")
-                    # P2: fill-confirmed protective SL (no naked SL, no over-hedged partial fills)
-                    sl = client.place_protective_sl_order(
-                        security_id=opt["security_id"],
-                        exchange_segment="NSE_FNO",
-                        transaction_type=client.dhan.SELL,
-                        quantity=qty,
-                        trigger_price=sl_px,
-                        product_type=client.dhan.INTRA,
-                    )
-                    if not sl["placed"]:
-                        state["daily_trades_count"] += 1
-                        return _flatten_trade(client, state, trade_record, "UNPROTECTED_POSITION_EXIT")
-                    trade_record["quantity"] = min(int(trade_record["quantity"]), int(sl["filled_qty"]))
-                    trade_record["sl_order_id"] = sl["placed"]
-
                 if not live:
                     print(f"Dry tick option candidate: {opt['symbol']} × {qty} @ ₹{entry_px}.")
                     return
-                state["active_trade"] = trade_record
-                state["daily_trades_count"] += 1
-                save_state(state)
-                print(f"🚀 [FAST-STRIKE OPTIONS] Entered {qty}x {opt['symbol']} @ ₹{entry_px} | Exchange SL: ₹{sl_px} (Order: {trade_record.get('sl_order_id')}) | Quick TP: ₹{tp_px} (+{target_pts} pts) | {trade_record['reason']}")
-                # Immediately stay alive in the 5-second live monitor loop!
-                return monitor_active_trade_loop(client, state, live=live, max_seconds=250, quiet_scan=quiet_scan)
+                raw_ask = opt["ask"] if opt["ask"] > 0 else entry_px
+                outcome = _start_entry(client, state, trade_record, client.dhan.BUY, client.dhan.LIMIT, raw_ask)
+                return _entry_tick_result(client, state, outcome, quiet_scan)
 
     # Weapon B: Scan 5x Intraday Liquid Equities
     eq_cand = scan_equity_candidates(client)
@@ -2499,18 +2498,20 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False,
         qty_by_margin = int(max_buying_power // entry_px)
         qty = max(1, min(qty_by_risk, qty_by_margin))
 
-        # Round equity SL/TP to NSE tick size (0.05 for equities)
-        eq_tick = 0.05
+        eq_tick = _get_tick_size(eq_cand["security_id"], "NSE_EQ")
+        try:
+            lot_size = broker_integer(_instrument_metadata(eq_cand["security_id"], "NSE_EQ").get(
+                "lot_size", eq_cand.get("lot_size", 1)))
+        except ValueError:
+            return 1 if live else None
         if eq_cand["direction"] == "LONG":
-            sl_px = round(round((entry_px - stop_dist) / eq_tick) * eq_tick, 2)
-            tp_px = round(round((entry_px + stop_dist * 2.0) / eq_tick) * eq_tick, 2)
+            sl_px = round_tick(entry_px - stop_dist, eq_tick)
+            tp_px = round_tick(entry_px + stop_dist * 2.0, eq_tick)
             txn = client.dhan.BUY
-            sl_txn = client.dhan.SELL
         else:
-            sl_px = round(round((entry_px + stop_dist) / eq_tick) * eq_tick, 2)
-            tp_px = round(round((entry_px - stop_dist * 2.0) / eq_tick) * eq_tick, 2)
+            sl_px = round_tick(entry_px + stop_dist, eq_tick)
+            tp_px = round_tick(entry_px - stop_dist * 2.0, eq_tick)
             txn = client.dhan.SELL
-            sl_txn = client.dhan.BUY
 
         trade_record = {
             "weapon": "EQUITY_5X",
@@ -2520,6 +2521,8 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False,
             "instrument_type": "EQUITY",
             "direction": eq_cand["direction"],
             "quantity": qty,
+            "tick_size": eq_tick,
+            "lot_size": lot_size,
             "entry_price": entry_px,
             "stop_loss": sl_px,
             "target_price": tp_px,
@@ -2528,42 +2531,11 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False,
             "live": live,
         }
 
-        if live:
-            entry_id = _submit_entry(client,
-                security_id=eq_cand["security_id"],
-                exchange_segment="NSE_EQ",
-                transaction_type=txn,
-                quantity=qty,
-                order_type=client.dhan.MARKET,
-                product_type=client.dhan.INTRA,
-                price=0,
-            )
-            if not entry_id:
-                return _flatten_trade(client, state, None, "ENTRY_UNVERIFIED")
-            trade_record["order_id"] = entry_id
-            # P2: fill-confirmed protective SL (no naked SL, no over-hedged partial fills)
-            sl = client.place_protective_sl_order(
-                security_id=eq_cand["security_id"],
-                exchange_segment="NSE_EQ",
-                transaction_type=sl_txn,
-                quantity=qty,
-                trigger_price=sl_px,
-                product_type=client.dhan.INTRA,
-            )
-            if not sl["placed"]:
-                state["daily_trades_count"] += 1
-                return _flatten_trade(client, state, trade_record, "UNPROTECTED_POSITION_EXIT")
-            trade_record["quantity"] = min(int(trade_record["quantity"]), int(sl["filled_qty"]))
-            trade_record["sl_order_id"] = sl["placed"]
-
         if not live:
             print(f"Dry tick equity candidate: {eq_cand['symbol']} × {qty} @ ₹{entry_px}.")
             return
-        state["active_trade"] = trade_record
-        state["daily_trades_count"] += 1
-        save_state(state)
-        print(f"⚔️ [WEAPON: 5x EQUITY] Entered {eq_cand['direction']} {qty}x {eq_cand['symbol']} @ ₹{entry_px} | Exchange SL: ₹{sl_px} (Order: {trade_record.get('sl_order_id')}) | TP: ₹{tp_px} | {eq_cand['reason']}")
-        return monitor_active_trade_loop(client, state, live=live, max_seconds=250, quiet_scan=quiet_scan)
+        outcome = _start_entry(client, state, trade_record, txn, client.dhan.MARKET, 0)
+        return _entry_tick_result(client, state, outcome, quiet_scan)
 
     if live:
         save_state(state)

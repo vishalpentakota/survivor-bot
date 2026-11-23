@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -433,7 +434,8 @@ class ExitCoordinator:
                 or integer(row["quantity"]) != pending["quantity"]):
             return False
         for field, expected in (("correlationId", pending.get("tag")),
-                                ("orderType", self.broker.MARKET if self.is_market(pending) else None)):
+                                ("orderType", self.broker.MARKET if self.is_market(pending)
+                                 else pending.get("requested_type"))):
             values = [candidate[field] for candidate in (row, detail) if field in candidate]
             known = pending.get(field, expected)
             if field in pending and not values:
@@ -560,6 +562,10 @@ class ExitCoordinator:
         pending = dict(oid=None, tag=tag, key=list(key), net=net, side=side,
                        quantity=qty, filled=0, protection=protection is not None, entry=entry is not None,
                        market=protection is None and entry is None)
+        if entry is not None:
+            pending["requested_type"] = entry["order_type"]
+        if protection is not None:
+            pending.update(requested_type=self.broker.SL, prices=protection)
         cycle["exposure"] = {
             oid: pair for oid, pair in cycle["exposure"].items() if tuple(pair[0]) != key
         }
@@ -572,7 +578,10 @@ class ExitCoordinator:
                       transaction_type=side, quantity=qty, tag=tag)
         if entry is not None:
             self.check_entry_allowed()
-            reply = self.broker.place_order(**entry, tag=tag)
+            try:
+                reply = self.broker.place_order(**entry, tag=tag)
+            except Exception:
+                return None
         elif protection is None:
             self.check_deadline_after_intent(state, cycle, previous)
             try:
@@ -580,7 +589,10 @@ class ExitCoordinator:
             except Exception:
                 return None
         else:
-            reply = self.broker.place_order(**params, order_type=self.broker.SL, **protection)
+            try:
+                reply = self.broker.place_order(**params, order_type=self.broker.SL, **protection)
+            except Exception:
+                return None
         if isinstance(reply, dict) and reply.get("status") == "success":
             try:
                 pending["oid"] = identifier(reply["data"]["orderId"])
@@ -634,35 +646,103 @@ class ExitCoordinator:
             pending["cancel_rejected"] = True
             self.save(state)
 
+    def inspect_intent(self, pending, book):
+        matches = [oid for oid, row in book.items()
+                   if oid == pending["oid"] or pending["tag"] and row.get("correlationId") == pending["tag"]]
+        if len(matches) != 1 or pending["oid"] not in (None, matches[0]):
+            raise ValueError("Order identity unavailable or ambiguous")
+        oid, = matches
+        row = book[oid]
+        detail = self.detail(oid)
+        if not self.matches_pending(pending, row, detail):
+            raise ValueError("Order evidence disagrees with intent")
+        if (fill(row) < pending.get("verified_fill", 0)
+                or pending.get("verified_terminal", row["orderStatus"]) != row["orderStatus"]):
+            raise ValueError("Order evidence regressed")
+        return oid, row, detail
+
+    def remember_intent(self, state, pending, oid, row):
+        evidence = {"oid": oid, "verified_fill": fill(row)}
+        if row["orderStatus"] in TERMINAL:
+            evidence["verified_terminal"] = row["orderStatus"]
+        if any(pending.get(field) != value for field, value in evidence.items()):
+            pending.update(evidence)
+            self.save(state)
+
+    @staticmethod
+    def stop_prices(row):
+        price, trigger = (float(row[field]) for field in ("price", "triggerPrice"))
+        if not all(math.isfinite(value) and value > 0 for value in (price, trigger)):
+            raise ValueError("Invalid stop prices")
+        return {"price": price, "trigger_price": trigger}
+
+    def inspect_stop(self, pending, book, exposure, *, state=None):
+        oid, row, detail = self.inspect_intent(pending, book)
+        if state is not None:
+            self.remember_intent(state, pending, oid, row)
+        key = tuple(pending["key"])
+        filled = fill(row)
+        signed = filled if pending["side"] == "BUY" else -filled
+        if exposure.get(key, 0) != pending["net"] + signed:
+            raise ValueError("Position has not corroborated the stop execution")
+        status = row["orderStatus"]
+        if status in TERMINAL:
+            return oid, status, None
+        if filled or status == "PART_TRADED":
+            return oid, "PARTIAL", None
+        if (status not in {"PENDING", "TRIGGER_PENDING", "CONFIRM"}
+                or row.get("orderType") != self.broker.SL or detail.get("orderType") != self.broker.SL):
+            raise ValueError("Stop is not confirmed resting")
+        prices = self.stop_prices(row)
+        if prices != self.stop_prices(detail):
+            raise ValueError("Stop prices disagree")
+        if pending["quantity"] != abs(pending["net"]):
+            raise ValueError("Stop quantity differs from exposure")
+        return oid, "RESTING", prices
+
     def protect(self, key, transaction_type, quantity, prices):
-        result = {"placed": None, "rejected": True, "filled_qty": 0}
+        """Place or recover one stop intent against independently verified exposure."""
+        result = {"placed": None, "rejected": False, "filled_qty": 0, "status": "UNKNOWN"}
         with locked(self.path) as state:
             self.deliver(state)
             book, exposure = self.snapshot()
             cycle = state["cycle"]
-            if cycle:
-                pending = cycle["pending"]
-                if (cycle["flatten"] or not pending or not pending.get("entry")
-                        or tuple(pending["key"]) != key or not self.settle(state, cycle, book, exposure)):
-                    return result
-                state["cycle"] = None
-                self.save(state)
-            net = exposure.get(key, 0)
-            result["filled_qty"] = abs(net)
-            if (not net or transaction_type != ("SELL" if net > 0 else "BUY")
-                    or any(row["orderStatus"] in WORKING for row in book.values())):
+            if cycle and (cycle["flatten"] or cycle.get("entry_workflow")):
                 return result
-            cycle = self.start(state, flatten=False)
-            oid = self.submit(state, cycle, key, net, min(abs(net), quantity), protection=prices)
-            if oid:
-                row = order_detail(self.broker, oid)
-                if (row["orderStatus"] in WORKING and instrument(row) == key
-                        and row["transactionType"] == transaction_type
-                        and integer(row["quantity"]) == min(abs(net), quantity)
-                        and fill(row) == 0):
-                    cycle["protected"] = True
+            pending = cycle["pending"] if cycle else None
+            if not pending:
+                net = exposure.get(key, 0)
+                if (not net or transaction_type != ("SELL" if net > 0 else "BUY")
+                        or quantity != abs(net) or any(row["orderStatus"] in WORKING for row in book.values())
+                        or self.execution_net(state, {}, key, {
+                            oid: row for oid, row in book.items() if instrument(row) == key
+                        })[0] != net or self.snapshot() != (book, exposure)):
+                    return result
+                cycle = cycle or self.start(state, flatten=False)
+                self.submit(state, cycle, key, net, quantity, protection=prices)
+                pending = cycle["pending"]
+                book, exposure = self.snapshot()
+            if (not pending["protection"] or tuple(pending["key"]) != key
+                    or pending["side"] != transaction_type):
+                return result
+            try:
+                oid, status, actual = self.inspect_stop(pending, book, exposure, state=state)
+                if self.snapshot() != (book, exposure):
+                    raise ValueError("Stop snapshot changed")
+            except (KeyError, TypeError, ValueError, RuntimeError, OSError):
+                alert_id = cycle["id"] + ":standalone-stop"
+                if not cycle.get("stop_alerted"):
+                    cycle["stop_alerted"] = True
+                    state["alerts"][alert_id] = f"Current protection could not be confirmed for {key}, intent {pending['tag']}."
                     self.save(state)
-                    result.update(placed=oid, rejected=False)
+                self.deliver(state)
+                return result
+            result.update(status=status, rejected=status == "REJECTED", filled_qty=abs(exposure.get(key, 0)))
+            if status == "RESTING" and actual == pending["prices"] == prices:
+                pending["oid"] = oid
+                cycle["protected"] = True
+                self.save(state)
+                result["placed"] = oid
             return result
 
     def closure(self, state, *, settle=True):
@@ -734,17 +814,23 @@ class ExitCoordinator:
             self.save(state)
         return None
 
-    def enter(self, params):
+    def enter(self, params, *, workflow=None):
         with locked(self.path) as state:
             self.deliver(state)
-            if state["cycle"]:
+            if state["cycle"] or "replay_check" in state:
                 return None
             book, exposure = self.snapshot()
             if any(exposure.values()) or any(row["orderStatus"] in WORKING for row in book.values()):
                 return None
             key = (str(params["security_id"]), params["exchange_segment"], params["product_type"])
+            if (self.execution_net(state, {}, key, {
+                    oid: row for oid, row in book.items() if instrument(row) == key
+                })[0] or self.snapshot() != (book, exposure)):
+                return None
             previous = state.copy()
             cycle = self.start(state, flatten=False)
+            if workflow is not None:
+                cycle["entry_workflow"] = workflow
             try:
                 return self.submit(state, cycle, key, 0, params["quantity"], entry=params)
             except MutationBlocked:
