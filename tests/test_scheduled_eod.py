@@ -330,6 +330,13 @@ class ScheduledEod(unittest.TestCase):
         opening = self.account()
         self.save_account({"net": 0, "writes": [], "orders": {}})
         self.clock.value = -3240.125
+        (self.directory / "exchange_calendar.json").write_text(json.dumps({
+            "source": "Mock exchange calendar fixture",
+            "sessions": {"2026-11-23": ["09:15", "15:30"]},
+        }))
+        self.broker.quote_data.return_value = VerifiedExits.response({"data": {"NSE_EQ": {"99": {
+            "last_price": 100, "last_trade_time": "2026-11-23T14:15:59+05:30",
+        }}}})
         coordinator = self.engine.ExitCoordinator
         save = coordinator.save
         crossed = []

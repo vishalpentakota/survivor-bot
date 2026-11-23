@@ -197,7 +197,10 @@ class WriteSafetyTests(unittest.TestCase):
         class EmptyFeed(list):
             empty = True
 
-        with (patch.object(self.engine, "load_state", return_value={"status": "ALIVE"}),
+        with (tempfile.TemporaryDirectory(dir=APP.parent) as directory,
+              patch.object(self.engine, "BASE_DIR", directory),
+              patch.object(self.engine, "_STATE_LOCK_FILE", Path(directory) / "state.lock"),
+              patch.object(self.engine, "load_state", return_value={"status": "ALIVE"}),
               patch.object(self.engine, "save_state"),
               patch.object(self.engine.SurvivorDhanClient, "fetch_candles", return_value=EmptyFeed())):
             self.engine.cmd_premarket(policy=policy)

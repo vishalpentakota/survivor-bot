@@ -28,6 +28,7 @@ class EntryProtection(unittest.TestCase):
         self.sdk.get_order_by_id.side_effect = lambda oid: self.response(self.details[oid].copy())
         self.sdk.get_positions.side_effect = lambda: self.response([self.position()] if self.net else [])
         self.sdk.place_order.side_effect = self.place
+        self.sdk.quote_data.side_effect = self.quote
         self.sdk.cancel_order.side_effect = lambda oid: self.response({"orderId": oid})
         self.entry_status = "PENDING"
         self.entry_fill = 0
@@ -38,6 +39,7 @@ class EntryProtection(unittest.TestCase):
         self.fills_at_send = False
         self.lot_size = 1
         self.monitor_price = None
+        self.entry_quote = 100
         self.time_elapsed = 0
         self.segment, self.side, self.symbol = "NSE_EQ", "BUY", "STAGED"
         self.state = self.engine.load_state()
@@ -59,7 +61,10 @@ class EntryProtection(unittest.TestCase):
         self.enterContext(patch.object(self.engine, "time", SimpleNamespace(
             sleep=self.sleep, time=lambda: self.time_elapsed)))
         self.enterContext(patch.object(self.engine, "send_telegram", return_value=False))
-        self.enterContext(patch.object(self.engine, "_get_latest_tick_ltp", return_value=None))
+        (self.directory / "exchange_calendar.json").write_text(json.dumps({
+            "source": "Mock exchange calendar fixture",
+            "sessions": {"2026-11-23": ["09:15", "15:30"], "2026-11-24": ["09:15", "15:30"]},
+        }))
         self.enterContext(patch.object(self.engine.SurvivorDhanClient, "fetch_candles",
                                       side_effect=self.candles))
 
@@ -68,9 +73,14 @@ class EntryProtection(unittest.TestCase):
             self.time_elapsed += seconds
 
     def candles(self, *args, **kwargs):
-        if self.monitor_price is None:
-            return SimpleNamespace(empty=True)
-        return SimpleNamespace(empty=False, iloc=[{"close": self.monitor_price}])
+        return SimpleNamespace(empty=True)
+
+    def quote(self, securities):
+        segment, (security,) = next(iter(securities.items()))
+        value = self.monitor_price if self.net else self.entry_quote
+        return self.response({"data": {segment: {str(security): {
+            "last_price": value, "last_trade_time": "2026-11-23T10:00:00+05:30",
+        }}}})
 
     @staticmethod
     def response(data):
@@ -119,7 +129,7 @@ class EntryProtection(unittest.TestCase):
     def start(self):
         return self.engine._start_entry(self.client, self.state, {
             "symbol": self.symbol, "weapon": "OPTIONS" if self.segment == "NSE_FNO" else "EQUITY_5X",
-            "security_id": "23", "exchange_segment": self.segment,
+            "security_id": "23", "exchange_segment": self.segment, "expiry": "2026-11-24",
             "instrument_type": "OPTIDX" if self.segment == "NSE_FNO" else "EQUITY",
             "direction": "LONG" if self.side == "BUY" else "SHORT", "entry_price": 100,
             "quantity": 5, "stop_loss": 94.96 if self.side == "BUY" else 105.04,
@@ -344,7 +354,9 @@ class EntryProtection(unittest.TestCase):
         self.sdk.get_fund_limits.return_value = self.response({"availabelBalance": 30000})
         (self.directory / ".tick_size_cache.json").write_text(
             json.dumps({"NSE_FNO:23": {"lot_size": 3, "tick_size": 0.125}}))
-        option = {"security_id": "23", "symbol": symbol, "lot_size": 5, "ltp": 100, "ask": 100.18}
+        self.entry_quote = 100.125
+        option = {"security_id": "23", "symbol": symbol, "lot_size": 5, "ltp": 100,
+                  "ask": 100.18, "expiry": "2026-11-24"}
         with (patch.object(engine, "INDEX_UNIVERSE", {"fixture": {
                     "security_id": "22", "lot_size": 5, "symbol_prefix": "FIX"}}),
               patch.object(engine, "evaluate_index_signal", return_value={"signal": signal, "reason": "fixture"}),

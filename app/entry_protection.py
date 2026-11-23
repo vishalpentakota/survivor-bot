@@ -187,7 +187,7 @@ def amendment_rejected(reply, oid):
         re.fullmatch(r"(?:.* )?explicit reject(?:ion)?[.!]?", remarks, re.IGNORECASE))
 
 
-def monitor_stop(coordinator, active, save, *, tick, trigger=None):
+def monitor_stop(coordinator, active, save, *, tick, trigger=None, amend_allowed=None):
     """Verify the resting stop and resolve a durable amendment, if present."""
     with locked(coordinator.path) as state:
         coordinator.deliver(state)
@@ -242,7 +242,7 @@ def monitor_stop(coordinator, active, save, *, tick, trigger=None):
                 active.pop("stop_amendment")
                 save()
                 return "RESTING"
-            elif trigger is not None:
+            elif trigger is not None and (amend_allowed is None or amend_allowed(pending["side"])):
                 prices = stop_prices(trigger, tick, pending["side"])
                 active["stop_amendment"] = {"prices": prices}
                 save()

@@ -310,8 +310,24 @@ class VerifiedExits(unittest.TestCase):
         self.sdk.place_order.side_effect = submit
         state = {'status': 'ALIVE', 'mortality_armed': True, 'peak_equity': 30000}
         now = datetime(2026, 11, 23, 10, tzinfo=engine.IST)
+        stage = engine.EXIT_LEDGER.parent
+        (stage / "exchange_calendar.json").write_text(json.dumps({
+            "source": "Mock exchange calendar fixture",
+            "sessions": {"2026-11-23": ["09:15", "15:30"]},
+        }))
+        self.sdk.quote_data.return_value = self.response({"data": {"NSE_EQ": {"23": {
+            "last_price": 100, "last_trade_time": now.isoformat(),
+        }}}})
         candidate = dict(security_id='23', symbol='STAGED', direction='LONG', ltp=100, atr=1, reason='fixture')
-        with patch.object(engine, 'datetime', wraps=datetime) as clock,              patch.object(engine, 'load_state', return_value=state), patch.object(engine, 'save_state'),              patch.object(engine, 'acquire_engine_lock', return_value=9), patch.object(engine, 'release_engine_lock'),              patch.object(engine, 'INDEX_UNIVERSE', {}), patch.object(engine, 'scan_equity_candidates', return_value=candidate):
+        with (patch.object(engine, 'datetime', wraps=datetime) as clock,
+              patch.object(engine, 'BASE_DIR', str(stage)),
+              patch.object(engine, '_STATE_LOCK_FILE', stage / 'state.lock'),
+              patch.object(engine, 'load_state', return_value=state),
+              patch.object(engine, 'save_state'),
+              patch.object(engine, 'acquire_engine_lock', return_value=9),
+              patch.object(engine, 'release_engine_lock'),
+              patch.object(engine, 'INDEX_UNIVERSE', {}),
+              patch.object(engine, 'scan_equity_candidates', return_value=candidate)):
             clock.now.return_value = now
             self.assertEqual(engine.cmd_tick(policy=engine.RolePolicy(trade=True)), 1)
         self.assertTrue(state['active_trade']['flatten_pending'])

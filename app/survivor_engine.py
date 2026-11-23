@@ -47,13 +47,14 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cloud_guard import LIVE_SWITCH, READ_ONLY, ReadOnlyBroker, RolePolicy, live_trading_enabled
 from dhan_broker import CachedTokenUnavailable, DhanTokenManager, load_env_file
+from market_preflight import ExchangeCalendar, broker_expiry, checked_bars, latest_quote, number, pending_orders
 from entry_protection import alert as protection_alert, monitor_stop, recover as recover_entry, round_tick, stop_prices
 from eod_ownership import (
     EodStore, IST, LOCK_POLL_SECONDS, WINDOW_SECONDS, owner_record, publish_owner, scheduled_slot,
 )
 from verified_exit import (
     ExitCoordinator, FlattenResult, MutationBlocked, TERMINAL, execution_evidence, fill as order_fill, instrument,
-    integer as broker_integer, locked as exit_lock, order_detail, persist as persist_exit_data, positions as verified_positions, same_execution,
+    integer as broker_integer, locked as exit_lock, order_detail, persist as persist_exit_data, positions as verified_positions, response_data, same_execution,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -356,42 +357,24 @@ def _get_tick_size(security_id: str, exchange_segment: str = "") -> float:
 
 def _get_latest_tick_ltp(client: "SurvivorDhanClient", security_id: str,
                          exchange_segment: str, instrument_type: str) -> Optional[float]:
-    """
-    Freshest available price from Dhan intraday minute data (last 1-min close,
-    including the in-progress minute when the API returns it). Returns None on
-    any failure so the caller falls back to the 1-min candle close.
-    Dhan returns OHLC as PARALLEL ARRAYS: {"open": [...], "close": [...]}.
-    (fix 2026-11-20: the previous parser expected scalars and always returned
-    None, which silently disabled the entire monitor loop.)
-    """
+    """Use the broker's last traded price and trade timestamp for this instrument."""
     try:
-        resp = client.dhan.intraday_minute_data(
-            security_id=str(security_id),
-            exchange_segment=exchange_segment,
-            instrument_type=instrument_type,
-            from_date=datetime.now(IST).strftime("%Y-%m-%d"),
-            to_date=datetime.now(IST).strftime("%Y-%m-%d"),
-        )
-        if not isinstance(resp, dict):
-            return None
-        data = resp.get("data")
-        if not isinstance(data, dict):
-            return None
-        payloads = [data]
-        if isinstance(data.get("data"), dict):
-            payloads.append(data["data"])
-        for payload in payloads:
-            closes = payload.get("close")
-            if isinstance(closes, (list, tuple)) and len(closes):
-                try:
-                    last = float(closes[-1])
-                except (TypeError, ValueError):
-                    continue
-                if last > 0:
-                    return last
-        return None
+        return latest_quote(client.dhan, security_id, exchange_segment, ExchangeCalendar(BASE_DIR),
+                            lambda: datetime.now(IST))
     except Exception:
         return None
+
+
+def _entry_market_open(trade):
+    now = datetime.now(IST)
+    try:
+        calendar = ExchangeCalendar(BASE_DIR)
+        calendar.expected_bars(now)
+        if trade["exchange_segment"] == "NSE_FNO":
+            calendar.expiry([trade.get("expiry")], now.date())
+        return _entry_window_open()
+    except (OSError, TypeError, ValueError, KeyError):
+        return False
 
 
 def _engine_lock_path():
@@ -777,38 +760,28 @@ class SurvivorDhanClient:
         net_liq = round(avail + utilized + unrealized, 2)
         return net_liq, round(avail, 2), round(utilized, 2), open_positions
 
-    def fetch_candles(self, security_id: str, exchange_segment: str = "IDX_I",
-                      instrument_type: str = "INDEX", days_back: int = 5,
-                      resample_tf: str = "5min") -> pd.DataFrame:
-        """Fetch 1-min candles via Dhan Pro Trader API and resample to 5min or 1min."""
-        now_ist = datetime.now(IST)
-        from_date = (now_ist - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        to_date = now_ist.strftime("%Y-%m-%d")
-
-        resp = self.dhan.intraday_minute_data(
+    def _candle_response(self, security_id, exchange_segment, instrument_type, days_back, now):
+        return self.dhan.intraday_minute_data(
             security_id=str(security_id),
             exchange_segment=exchange_segment,
             instrument_type=instrument_type,
-            from_date=from_date,
-            to_date=to_date,
+            from_date=(now - timedelta(days=days_back)).date().isoformat(),
+            to_date=now.date().isoformat(),
         )
-        if resp.get("status") != "success" or not resp.get("data"):
-            return pd.DataFrame()
 
-        d = resp["data"]
-        if not isinstance(d, dict) or not d.get("close"):
+    def fetch_candles(self, security_id: str, exchange_segment: str = "IDX_I",
+                      instrument_type: str = "INDEX", days_back: int = 5,
+                      resample_tf: str = "5min", *, require_current=False) -> pd.DataFrame:
+        """Validate minute bars before aggregation, with session freshness for entry scans."""
+        now = datetime.now(IST)
+        try:
+            response = self._candle_response(security_id, exchange_segment, instrument_type, days_back, now)
+            now = datetime.now(IST)
+            expected = ExchangeCalendar(BASE_DIR).expected_bars(now) if require_current else None
+            times, columns = checked_bars(response, now, expected)
+        except Exception:
             return pd.DataFrame()
-
-        df = pd.DataFrame({
-            "timestamp": pd.to_datetime(d["timestamp"], unit="s", utc=True).tz_convert(IST),
-            "open": d["open"],
-            "high": d["high"],
-            "low": d["low"],
-            "close": d["close"],
-            "volume": d["volume"],
-        })
-        df.set_index("timestamp", inplace=True)
-        df.sort_index(inplace=True)
+        df = pd.DataFrame(columns, index=pd.DatetimeIndex(times, name="timestamp"))
 
         if resample_tf and resample_tf != "1min":
             df = df.resample(resample_tf).agg({
@@ -916,22 +889,13 @@ class SurvivorDhanClient:
         for a given index using live Greeks & Bid/Ask spread from Dhan's `option_chain` endpoint,
         with automatic fallback to Security Master + Intraday Candles if `/v2/optionchain` is 502/off-hours.
         """
-        today_str = datetime.now(IST).strftime("%Y-%m-%d")
-        exp_resp = self.dhan.expiry_list(under_security_id=under_security_id, under_exchange_segment="IDX_I")
-        if exp_resp.get("status") != "success":
-            return self._fallback_option_from_security_master(direction, max_lot_cost, under_security_id, lot_size, index_name, today_str)
-        expiries = exp_resp.get("data", {}).get("data", [])
-        if not expiries:
-            return self._fallback_option_from_security_master(direction, max_lot_cost, under_security_id, lot_size, index_name, today_str)
-
-        # Select nearest expiry, skipping 0DTE (expiry == today_str) so we never get crushed by
-        # expiry-day gamma/theta whipsaws or newly minted strikes with 0 historical chart bars.
-        valid_expiries = [e for e in expiries if e > today_str]
-        if not valid_expiries:
-            # P6: hard 0DTE ban — if only same-day expiry is listed, do not trade it.
-            logger.warning("0DTE guard: only same-day expiry available; refusing 0DTE (no fallback to today).")
+        today = datetime.now(IST).date()
+        today_str = today.isoformat()
+        try:
+            target_expiry = broker_expiry(self.dhan, under_security_id, ExchangeCalendar(BASE_DIR), today)
+        except Exception:
+            logger.warning("Unverified option expiry for %s", index_name)
             return None
-        target_expiry = valid_expiries[0]
 
         oc_resp = self.dhan.option_chain(
             under_security_id=under_security_id,
@@ -1380,7 +1344,7 @@ def verify_option_chart_momentum(client: SurvivorDhanClient, security_id: str) -
     3) Anti-Spike Overextension Cap (Day 3 Audit): `LTP <= EMA9 * 1.15` (rejects buying an option stretched >15%
        above its 3m EMA9 at the climax of a 5-candle spike right before a 1-min pullback wick).
     """
-    df_opt = client.fetch_candles(security_id, exchange_segment="NSE_FNO", instrument_type="OPTIDX", days_back=4, resample_tf="3min")
+    df_opt = client.fetch_candles(security_id, exchange_segment="NSE_FNO", instrument_type="OPTIDX", days_back=4, resample_tf="3min", require_current=True)
     df_opt = option_session_frame(df_opt)
     if df_opt.empty:
         return False, f"OptChart Insufficient Session Bars (< {MIN_OPT_SESSION_BARS} today) — refusing blind entry"
@@ -1404,7 +1368,7 @@ def scan_equity_candidates(client: SurvivorDhanClient) -> Optional[Dict]:
     best = None
     for sym, sec_id in LIQUID_EQUITY_UNIVERSE.items():
         try:
-            df = client.fetch_candles(sec_id, exchange_segment="NSE_EQ", instrument_type="EQUITY", days_back=4, resample_tf="3min")
+            df = client.fetch_candles(sec_id, exchange_segment="NSE_EQ", instrument_type="EQUITY", days_back=4, resample_tf="3min", require_current=True)
             if df.empty or len(df) < 25:
                 continue
             df = compute_indicators(df)
@@ -1613,7 +1577,7 @@ def cmd_status(live_Orders: bool = False, *, policy: Optional[RolePolicy] = None
     for name, cfg in INDEX_UNIVERSE.items():
         try:
             sid = cfg["security_id"]
-            df = client.fetch_candles(sid, exchange_segment="IDX_I", instrument_type="INDEX", days_back=5, resample_tf="3min")
+            df = client.fetch_candles(sid, exchange_segment="IDX_I", instrument_type="INDEX", days_back=5, resample_tf="3min", require_current=True)
             sig = evaluate_index_signal(df)
             if sig.get("signal") in ("LONG", "SHORT"):
                 index_scan_lines.append(f"  • {name}: {sig['reason']}")
@@ -1663,6 +1627,14 @@ def cmd_status(live_Orders: bool = False, *, policy: Optional[RolePolicy] = None
 def _start_entry(client, state, trade, side, order_type, price):
     if not client._policy.trade or state.get("active_trade"):
         return "pending"
+    def market_verified():
+        return _entry_market_open(trade) and _get_latest_tick_ltp(
+            client, trade["security_id"], trade["exchange_segment"], trade["instrument_type"]
+        ) is not None
+
+    if not market_verified():
+        print("Entry preflight denied: exchange session, expiry or broker quote unverified.")
+        return "denied"
     trade = trade.copy()
     tick = float(trade["tick_size"])
     lot = int(trade["lot_size"])
@@ -1676,8 +1648,17 @@ def _start_entry(client, state, trade, side, order_type, price):
         return "idle"
     trigger = trade.pop("stop_loss")
     workflow = {"trade": trade, "trigger": trigger, "limit": limit}
+    denied = False
+
+    def check_before_send():
+        nonlocal denied
+        denied = not market_verified()
+        return not denied
+
     try:
-        _exit_coordinator(client).enter({
+        coordinator = _exit_coordinator(client)
+        coordinator.entry_allowed = check_before_send
+        coordinator.enter({
             "security_id": trade["security_id"], "exchange_segment": trade["exchange_segment"],
             "transaction_type": side, "quantity": quantity, "order_type": order_type,
             "product_type": client.dhan.INTRA, "price": workflow["limit"],
@@ -1685,28 +1666,29 @@ def _start_entry(client, state, trade, side, order_type, price):
     except Exception:
         logger.exception("Entry submission unresolved")
         return "pending"
+    if denied:
+        print("Entry preflight denied: market evidence changed before submission.")
+        return "denied"
     return _resume_entry(client, state)
 
 
 def _entry_chase(client, coordinator, work, pending, oid, book, exposure):
     trade = work["trade"]
     limit = work["limit"]
-    if pending["requested_type"] != "LIMIT" or pending["side"] != "BUY":
+    if pending["requested_type"] != "LIMIT" or pending["side"] != "BUY" or not _entry_market_open(trade):
         return False
     security = str(trade["security_id"])
     exchange = trade["exchange_segment"]
     instrument_type = trade["instrument_type"]
+    if coordinator.snapshot() != (book, exposure):
+        return False
     fresh = _get_latest_tick_ltp(client, security, exchange, instrument_type)
-    if not fresh:
-        frame = client.fetch_candles(security, exchange_segment=exchange, instrument_type=instrument_type,
-                                     days_back=1, resample_tf="1min")
-        fresh = float(frame.iloc[-1]["close"]) if not frame.empty else None
     tick = trade["tick_size"]
     cap = round_tick(limit * (1 + MAX_ENTRY_CHASE_PCT), tick, floor=True)
     if not fresh or not limit < fresh <= cap:
         return False
     price = min(cap, round_tick(fresh * 1.005, tick))
-    if price <= limit or coordinator.snapshot() != (book, exposure):
+    if price <= limit:
         return False
     try:
         coordinator.check_entry_allowed()
@@ -1761,7 +1743,7 @@ def _entry_tick_result(client, state, outcome, quiet_scan):
         print(f"Entered {active['quantity']}x {active['symbol']} @ ₹{active['entry_price']} | "
               f"Verified exchange SL ₹{active['stop_loss']} (Order {active['sl_order_id']})")
         return monitor_active_trade_loop(client, state, max_seconds=250, quiet_scan=quiet_scan)
-    return int(outcome == "pending")
+    return int(outcome in ("pending", "denied"))
 
 
 def _today_entries(journal: list, setup: str = None, direction: str = None, security_id=None) -> list:
@@ -2104,9 +2086,14 @@ def _flatten_trade(client, state, active, reason):
 
 
 def _inspect_active_stop(client, state, active, tick, *, trigger=None):
+    def amend_allowed(side):
+        price = _get_latest_tick_ltp(client, active["security_id"], active["exchange_segment"],
+                                     active["instrument_type"])
+        return price is not None and (trigger < price if side == "SELL" else trigger > price)
+
     try:
         return monitor_stop(_exit_coordinator(client), active, lambda: save_state(state),
-                            tick=tick, trigger=trigger)
+                            tick=tick, trigger=trigger, amend_allowed=amend_allowed)
     except Exception:
         logger.exception("Active stop recovery could not be verified")
         return "UNKNOWN"
@@ -2178,19 +2165,9 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
                 return _flatten_trade(client, state, active,
                                       "EXCHANGE_SL_FILLED" if status == "TRADED" else "PROTECTION_EXIT")
 
-        # 3. Resolve current LTP: prefer the latest intraday tick, fall back to
-        #    the 1-min candle close. The monitoring logic below runs on EVERY
-        #    poll regardless of tick availability (fix 2026-11-20: this whole
-        #    block was accidentally nested inside the tick-lookup branch, so
-        #    when the tick API returned nothing the engine went blind and rode
-        #    a +Rs945 peak all the way back to the original SL).
-        df_1m = client.fetch_candles(sec_id, exchange_segment=exch, instrument_type=inst,
-                                      days_back=1, resample_tf="1min")
-        curr_ltp = float(df_1m.iloc[-1]["close"]) if not df_1m.empty else 0.0
-        _tick_ltp = _get_latest_tick_ltp(client, sec_id, exch, inst)
-        if _tick_ltp and curr_ltp > 0 and abs(_tick_ltp - curr_ltp) / curr_ltp < 0.5:
-            curr_ltp = _tick_ltp   # fresh tick within 50% of candle close: trust it
-        if curr_ltp <= 0:
+        # Broker position/protection checks above still run during a quote outage.
+        curr_ltp = _get_latest_tick_ltp(client, sec_id, exch, inst)
+        if curr_ltp is None:
             time.sleep(MONITOR_POLL_S)
             continue
 
@@ -2504,6 +2481,10 @@ def _tick_with_state(*, policy: RolePolicy, quiet_scan: bool, owner_fd):
         except Exception:
             pass
 
+    if live and not _entry_market_open({"exchange_segment": "NSE_EQ"}):
+        print("Entry preflight denied: exchange session unverified.")
+        return 1
+
     # Weapon A: Scan ALL indices (Nifty 50 + Bank + FinNifty + Next 50 + Midcap Select) in parallel,
     # pick the strongest signal (highest confidence), then find its best option contract.
     best_idx_sig = None
@@ -2517,7 +2498,7 @@ def _tick_with_state(*, policy: RolePolicy, quiet_scan: bool, owner_fd):
             continue
         try:
             sid = cfg["security_id"]
-            df = client.fetch_candles(sid, exchange_segment="IDX_I", instrument_type="INDEX", days_back=5, resample_tf="3min")
+            df = client.fetch_candles(sid, exchange_segment="IDX_I", instrument_type="INDEX", days_back=5, resample_tf="3min", require_current=True)
             sig = evaluate_index_signal(df)
             if sig.get("signal") in ("LONG", "SHORT"):
                 if sig.get("setup") in DISABLED_SETUPS:
@@ -2563,6 +2544,11 @@ def _tick_with_state(*, policy: RolePolicy, quiet_scan: bool, owner_fd):
         if opt:
             opt_ok, opt_chart_msg = verify_option_chart_momentum(client, opt["security_id"])
             if opt_ok:
+                market_price = _get_latest_tick_ltp(client, opt["security_id"], "NSE_FNO", "OPTIDX")
+                if market_price is None:
+                    print("Entry preflight denied: option broker quote unverified.")
+                    return 1 if live else None
+                opt = {**opt, "ltp": market_price}
                 # P9: per-setup entry budget + never chase above the day's first fill
                 _journal = load_journal()
                 _setup = idx_sig.get("setup", "FAST_STRIKE")
@@ -2603,6 +2589,7 @@ def _tick_with_state(*, policy: RolePolicy, quiet_scan: bool, owner_fd):
                     "security_id": opt["security_id"],
                     "exchange_segment": "NSE_FNO",
                     "instrument_type": "OPTIDX",
+                    "expiry": opt.get("expiry"),
                     "direction": "LONG",
                     "underlying_direction": idx_sig["signal"],
                     "underlying_index": best_idx_name,
@@ -2620,13 +2607,17 @@ def _tick_with_state(*, policy: RolePolicy, quiet_scan: bool, owner_fd):
                 if not live:
                     print(f"Dry tick option candidate: {opt['symbol']} × {qty} @ ₹{entry_px}.")
                     return
-                raw_ask = opt["ask"] if opt["ask"] > 0 else entry_px
-                outcome = _start_entry(client, state, trade_record, client.dhan.BUY, client.dhan.LIMIT, raw_ask)
+                outcome = _start_entry(client, state, trade_record, client.dhan.BUY, client.dhan.LIMIT, entry_px)
                 return _entry_tick_result(client, state, outcome, quiet_scan)
 
     # Weapon B: Scan 5x Intraday Liquid Equities
     eq_cand = scan_equity_candidates(client)
     if eq_cand:
+        market_price = _get_latest_tick_ltp(client, eq_cand["security_id"], "NSE_EQ", "EQUITY")
+        if market_price is None:
+            print("Entry preflight denied: equity broker quote unverified.")
+            return 1 if live else None
+        eq_cand["ltp"] = market_price
         # P9: per-security entry budget + never chase above the day's first fill
         _journal = load_journal()
         _eq_prior = _today_entries(_journal, security_id=eq_cand["security_id"], direction=eq_cand["direction"])
@@ -2792,17 +2783,8 @@ def _reconcile_with_state(policy):
     print("=" * 72)
 
 
-def cmd_premarket(*, policy: Optional[RolePolicy] = None) -> None:
-    """
-    Daily pre-market readiness check.
-    1. JWT Token Freshness Check: Uses a valid cached token in read-only mode.
-    2. Dhan IP Whitelist Verification (`/v2/ip/getIP`): Checks `ordersAllowed`.
-    3. Pro Trader Data API & Multi-Index Feed Check: Verifies candle feed + non-0DTE expiry selection across all 5 indices.
-    4. Daily State & Guardrail Reset: Resets `daily_date`, `daily_start_equity`, `daily_trades_count = 0`, `daily_halted = False`, and clears stale overnight cooldowns before 09:15 IST.
-    5. Broker Position & Order Hygiene: Confirms 0 open positions and 0 orphan pending orders before the bell.
-
-    Repair requires premarket --live --repair and SURVIVOR_LIVE_TRADING=1.
-    """
+def cmd_premarket(*, policy: Optional[RolePolicy] = None) -> int:
+    """Check readiness, with token/IP repair restricted to the explicit repair role."""
     policy = policy if policy is not None else _resolve_role("premarket")
     if policy.repair_ip:
         with _state_transaction():
@@ -2813,105 +2795,103 @@ def cmd_premarket(*, policy: Optional[RolePolicy] = None) -> None:
 def _premarket_with_state(policy):
     allow_repair = policy.repair_ip
     state = load_state(read_only=not allow_repair)
-    if not allow_repair:
-        state = state.copy()
     if state["status"] == "DEAD_COMA":
-        print("🪦 [PRE-MARKET CHECK] SURVIVOR BOT IS IN PERMANENT COMA (DEAD_COMA).")
-        return
+        print("PRE-MARKET ACTION REQUIRED — survivor is in permanent coma.")
+        return 1
 
+    now = datetime.now(IST)
+    issues = []
     try:
         client = SurvivorDhanClient(policy=policy)
-    except CachedTokenUnavailable as exc:
-        print(f"🚨 PRE-MARKET ACTION REQUIRED — {exc}")
-        return
-    now_ist = datetime.now(IST)
-    today_str = now_ist.strftime("%Y-%m-%d")
+        if allow_repair and (
+            not client.tm.token_expiry
+            or client.tm.token_expiry - datetime.now() < timedelta(hours=8)
+        ):
+            client.reconnect_with_fresh_token()
+        ip_info = client.ensure_ip_whitelisted(allow_update=allow_repair)
+        if not client.tm.access_token or not client.tm.token_expiry:
+            issues.append("cached token unverified")
+        if not isinstance(ip_info, dict) or ip_info.get("ordersAllowed") is not True:
+            issues.append("broker order permission unverified or denied")
+    except Exception:
+        print("PRE-MARKET ACTION REQUIRED — broker authentication or IP check unavailable.")
+        return 1
 
-    # 1. Ensure JWT token will last through the entire market session (until at least 16:30 IST today)
-    token_repaired = False
-    if allow_repair and (
-        not client.tm.token_expiry
-        or (client.tm.token_expiry - datetime.now()).total_seconds() < 8 * 3600
-    ):
-        client.reconnect_with_fresh_token()
-        token_repaired = True
-    token_exp_str = client.tm.token_expiry.strftime("%Y-%m-%d %H:%M IST") if client.tm.token_expiry else "UNKNOWN"
+    try:
+        exposure = verified_positions(client.dhan)
+        if any(exposure.values()):
+            issues.append("open positions present")
+    except Exception:
+        exposure = {}
+        issues.append("positions unverified")
+    try:
+        pending = pending_orders(client.dhan, exposure)
+        if any(pending.values()):
+            issues.append(f"pending orders ({pending['entry-capable']} entry-capable, "
+                          f"{pending['protective']} protective)")
+    except Exception:
+        issues.append("orders unverified")
+    try:
+        funds = response_data(client.dhan.get_fund_limits())
+        avail = number(funds["availabelBalance"], allow_zero=True)
+        net_liq = avail + number(funds["utilizedAmount"], allow_zero=True)
+        if not math.isfinite(net_liq):
+            raise ValueError("Invalid account equity")
+    except Exception:
+        issues.append("funds unverified")
 
-    # 2. Verify IPv4 Whitelist & ordersAllowed
-    ip_info = client.ensure_ip_whitelisted(allow_update=allow_repair)
-    orders_allowed = bool(ip_info.get("ordersAllowed"))
-    ip_match = ip_info.get("ipMatchStatus", "UNKNOWN")
-    detected_ip = ip_info.get("detectedIP", "UNKNOWN")
-
-    # 3. Verify Live Funds, Positions & Orders
-    net_liq, avail, utilized, open_pos = client.get_live_equity_and_positions()
-    orders_resp = client.dhan.get_order_list()
-    pending_orders = [
-        o for o in (orders_resp.get("data", []) if isinstance(orders_resp, dict) else [])
-        if o.get("orderStatus") in ("PENDING", "TRANSIT")
-    ]
-
-    # 4. Reset Daily State cleanly for today's session
-    if state.get("daily_date") != today_str:
-        state["daily_date"] = today_str
-        state["daily_start_equity"] = net_liq
-        state["daily_trades_count"] = 0
-        state["daily_consecutive_losses"] = 0
-        state["daily_halted"] = False
-        state["daily_halt_reason"] = ""
-        state["last_sl_direction"] = None
-        state["last_sl_time"] = None
-    state["current_equity"] = net_liq
-    state["available_cash"] = avail
-    if allow_repair:
-        save_state(state)
-
-    # 5. Multi-Index Data API & Non-0DTE Expiry Check (with Security Master fallback when pre-9:15 optionchain is 502)
     idx_checks = []
-    feeds_ok = 0
-    sec_df = None
-    for name, cfg in INDEX_UNIVERSE.items():
-        sid = cfg["security_id"]
-        sym_prefix = cfg["symbol_prefix"]
-        df = client.fetch_candles(sid, exchange_segment="IDX_I", instrument_type="INDEX", days_back=4, resample_tf="3min")
-        exp_resp = client.dhan.expiry_list(under_security_id=int(sid), under_exchange_segment="IDX_I")
-        exps = exp_resp.get("data", {}).get("data", []) if exp_resp.get("status") == "success" else []
-        exp_src = "API"
-        if not exps:
-            if sec_df is None:
-                sec_df = client.dhan.fetch_security_list(mode="compact")
-            m = sec_df[
-                (sec_df["SEM_INSTRUMENT_NAME"] == "OPTIDX")
-                & (sec_df["SEM_TRADING_SYMBOL"].astype(str).str.startswith(sym_prefix + "-"))
-            ]
-            exps = sorted(m["SEM_EXPIRY_DATE"].astype(str).str[:10].unique().tolist())
-            exp_src = "SecMaster"
-        non_0dte = [e for e in exps if e > today_str]
-        chosen_exp = non_0dte[0] if non_0dte else (exps[0] if exps else "NONE")
-        if not df.empty and chosen_exp != "NONE":
-            feeds_ok += 1
-            last_spot = float(df.iloc[-1]["close"])
-            idx_checks.append(f"  ✅ {name:<19} | Spot: {last_spot:>8.1f} ({len(df)} bars) | Next Exp: {chosen_exp} [{exp_src}, Lot {cfg['lot_size']}]")
-        else:
-            idx_checks.append(f"  ❌ {name:<19} | Bars: {len(df):<3} | Next Exp: {chosen_exp}")
+    try:
+        calendar = ExchangeCalendar(BASE_DIR)
+        opening, _ = calendar.expected_bars(now, allow_prior=True)
+    except (OSError, TypeError, ValueError, KeyError):
+        issues.append("exchange calendar unverified or session unavailable")
+    else:
+        for name, cfg in INDEX_UNIVERSE.items():
+            sid = cfg["security_id"]
+            try:
+                # Start no later than the expected session, including long closures.
+                days_back = max(4, (now.date() - opening.date()).days)
+                response = client._candle_response(sid, "IDX_I", "INDEX", days_back, now)
+                checked_at = datetime.now(IST)
+                expected = calendar.expected_bars(checked_at, allow_prior=True)
+                if expected[0] != opening:
+                    raise ValueError("Exchange session changed during checks")
+                times, bars = checked_bars(response, checked_at, expected)
+            except Exception:
+                issues.append(f"{name} bars unverified")
+                continue
+            try:
+                expiry = broker_expiry(client.dhan, sid, calendar, now.date())
+            except Exception:
+                issues.append(f"{name} expiry unverified or denied by policy")
+                continue
+            idx_checks.append(f"{name} | close {bars['close'][-1]:.1f} | "
+                              f"bar {times[-1].isoformat()} | expiry {expiry}")
 
-    tier = get_survival_tier(net_liq)
-    overall_ok = orders_allowed and (feeds_ok == len(INDEX_UNIVERSE)) and (len(open_pos) == 0)
-    header_icon = "✅ PRE-MARKET SYSTEM CHECK PASSED" if overall_ok else "🚨 PRE-MARKET ACTION REQUIRED"
+    if not issues and (
+        opening.date() != now.date() and datetime.now(IST) >= calendar.sessions[now.date()][0]
+    ):
+        issues.append("exchange opened during premarket checks")
+    if issues:
+        print(f"PRE-MARKET ACTION REQUIRED — {now.isoformat()}")
+        for issue in issues:
+            print(f"  {issue}")
+        return 1
 
-    print(f"{header_icon} — {today_str} ({now_ist.strftime('%H:%M')} IST)")
-    print("=" * 68)
-    print(f"1. Auth & Token   : {'✅ VALID' if client.tm.access_token else '❌ INVALID'} (Expires: {token_exp_str}{', renewed now' if token_repaired else ''})")
-    print(f"2. IP Whitelist   : {'✅ ALLOWED' if orders_allowed else '🚨 BLOCKED (DH-905 RISK)'} | IP: {detected_ip} ({ip_match})")
-    if not orders_allowed:
-        print(f"   ⚠️ URGENT: ISP rotated IP to {detected_ip}! Update Primary/Secondary IP on web.dhan.co before 09:15 IST!")
-    print(f"3. Account Equity : ₹{net_liq:,.2f} (Cash: ₹{avail:,.2f}) | Life: {tier['life_pct']}% | Tier: {tier['tier']}")
-    print(f"4. Risk & Target  : Risk/Trade: ₹{tier['risk_per_trade_inr']:,.0f} | Max Daily Loss: ₹{tier['daily_max_loss_inr']:,.0f} | Daily Target: +₹1,500 Net")
-    print(f"5. State & Slate  : Date={state['daily_date']} | Halted={state['daily_halted']} | OpenPos={len(open_pos)} | PendingOrders={len(pending_orders)}")
-    print("6. 5-Index Feeds & Non-0DTE Expiries:")
+    if allow_repair:
+        today = now.date().isoformat()
+        if state.get("daily_date") != today:
+            state.update(daily_date=today, daily_start_equity=net_liq, daily_trades_count=0,
+                         daily_consecutive_losses=0, daily_halted=False, daily_halt_reason="",
+                         last_sl_direction=None, last_sl_time=None)
+        state.update(current_equity=net_liq, available_cash=avail)
+        save_state(state)
+    print(f"PRE-MARKET SYSTEM CHECK PASSED — {now.isoformat()}")
+    print(f"Account equity ₹{net_liq:,.2f} | no open positions or pending orders")
     for line in idx_checks:
-        print(line)
-    print("=" * 68)
+        print(f"  {line}")
+    return 0
 
 
 def main():
@@ -2931,7 +2911,7 @@ def main():
     if args.action == "status":
         cmd_status(policy=policy)
     elif args.action == "premarket":
-        cmd_premarket(policy=policy)
+        return cmd_premarket(policy=policy)
     elif args.action == "tick":
         if cmd_tick(quiet_scan=args.quiet, policy=policy):
             sys.exit(1)
