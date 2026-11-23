@@ -27,6 +27,12 @@ import fcntl
 import socket
 import argparse
 import logging
+from contextlib import contextmanager
+from hashlib import sha256
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from threading import local
+from time import monotonic
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
@@ -134,39 +140,119 @@ LIQUID_EQUITY_UNIVERSE = {
 
 # ─── State & Journal Persistence (with File Locking) ──────────────────────
 
-_STATE_LOCK_FILE = os.path.join(BASE_DIR, ".survivor_state.lock")
+_STATE_LOCK_FILE = os.path.join(BASE_DIR, ".survivor_state.flock")
+_STATE_OWNER = local()
+
+
+class StateUnavailable(OSError):
+    """State authority could not be acquired or persisted."""
+
+
+class CorruptState(StateUnavailable):
+    """State authority requires restoration from trusted evidence."""
+
+
+class StateSnapshot(dict):
+    def __init__(self, values, raw):
+        super().__init__(values)
+        self.raw = raw
+
+    def copy(self):
+        return StateSnapshot(self, self.raw)
 
 
 def _acquire_state_lock(timeout: float = 5.0) -> Optional[int]:
-    """Acquire a cross-process file lock using O_CREAT|O_EXCL atomic creation."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            fd = os.open(_STATE_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            return fd
-        except FileExistsError:
-            # Stale lock? Check age and break if >30s old.
+    """Keep a stable inode. Process death releases ownership, regardless of age."""
+    fd = os.open(_STATE_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    owned = False
+    deadline = monotonic() + timeout
+    try:
+        while True:
             try:
-                age = time.time() - os.path.getmtime(_STATE_LOCK_FILE)
-                if age > 30.0:
-                    os.unlink(_STATE_LOCK_FILE)
-                    continue
-            except OSError:
-                pass
-            time.sleep(0.1)
-    return None
-
-
-def _release_state_lock(fd: Optional[int]) -> None:
-    if fd is not None:
-        try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return None
+                time.sleep(min(0.1, remaining))
+            else:
+                # The legacy O_EXCL file contains no owner identity. Its age
+                # cannot establish whether the old process is still writing.
+                if os.path.exists(os.path.join(BASE_DIR, ".survivor_state.lock")):
+                    return None
+                owned = True
+                return fd
+    finally:
+        if not owned:
             os.close(fd)
-        except OSError:
-            pass
+
+
+def _release_state_lock(fd: int) -> None:
+    os.close(fd)
+
+
+@contextmanager
+def _state_transaction():
+    if getattr(_STATE_OWNER, "pid", None) == os.getpid():
+        yield
+        return
+    fd = _acquire_state_lock()
+    if fd is None:
+        raise StateUnavailable("State ownership unavailable")
+    _STATE_OWNER.pid = os.getpid()
+    try:
+        yield
+    finally:
+        del _STATE_OWNER.pid
+        _release_state_lock(fd)
+
+
+def _quarantine_state(path, raw):
+    evidence = path.with_name(path.name + ".corrupt." + sha256(raw).hexdigest())
+    with NamedTemporaryFile(dir=path.parent, prefix=".state-evidence-", delete=False) as copy:
+        temporary = Path(copy.name)
         try:
-            os.unlink(_STATE_LOCK_FILE)
-        except OSError:
-            pass
+            copy.write(raw)
+            copy.flush()
+            os.fsync(copy.fileno())
+            try:
+                os.link(temporary, evidence)
+            except FileExistsError:
+                if evidence.read_bytes() != raw:
+                    raise StateUnavailable("State quarantine evidence conflicts")
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temporary.unlink()
+
+
+def _read_state_storage(*, quarantine=False):
+    path = Path(STATE_FILE)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        if any(path.parent.glob(path.name + ".corrupt.*")):
+            raise CorruptState("State missing after quarantine")
+        return {}, None
+    try:
+        saved = json.loads(raw.decode("utf-8"))
+        if (not isinstance(saved, dict)
+                or saved.get("status") not in {"AWAITING_FUNDING", "ALIVE", "DEAD_COMA"}
+                or saved.get("active_trade") is not None and not isinstance(saved["active_trade"], dict)
+                or "emergency_recovery" in saved and (
+                    not isinstance(saved["emergency_recovery"], dict)
+                    or saved["emergency_recovery"].get("status") not in ("pending", "verified")
+                    or any(not isinstance(saved["emergency_recovery"].get(key), str)
+                           for key in ("reason", "id", "started_at")))):
+            raise ValueError("Invalid state shape")
+    except (ValueError, RecursionError) as exc:
+        if quarantine:
+            _quarantine_state(path, raw)
+        raise CorruptState("State is corrupt; restore trusted state before resuming trading") from exc
+    return saved, raw
 
 
 # ─── Patched-engine timing constants (patchable so tests run fast) ─────────
@@ -415,6 +501,9 @@ def _scheduled_flatten(policy: RolePolicy) -> int:
 
 
 def cmd_flatten(policy: RolePolicy, *, scheduled: bool = False) -> int:
+    if not policy.flatten:
+        print("Emergency flatten requires an authorized flatten role.")
+        return 1
     if scheduled:
         return _scheduled_flatten(policy)
     fd = acquire_engine_lock()
@@ -422,16 +511,71 @@ def cmd_flatten(policy: RolePolicy, *, scheduled: bool = False) -> int:
         print("Emergency flatten unavailable: engine ownership held by another invocation.")
         return 1
     try:
-        try:
+        with _state_transaction():
+            try:
+                state = load_state()
+            except CorruptState:
+                return _flatten_corrupt_state(policy)
+            _begin_emergency(state, "MANUAL_EMERGENCY_EXIT")
             client = SurvivorDhanClient(policy=policy)
-        except CachedTokenUnavailable as exc:
-            print(f"Emergency flatten unavailable: {exc}")
-            return 1
-        result = client.emergency_flatten_all()
-        print("Emergency Flatten:", result)
-        return int(not result.flat)
+            return _run_emergency(client, state)
+    except (CachedTokenUnavailable, OSError) as exc:
+        print(f"Emergency flatten unavailable: {exc}")
+        return 1
     finally:
         release_engine_lock(fd)
+
+
+def _flatten_corrupt_state(policy):
+    # Keep the account exit independently recoverable while local accounting
+    # remains fenced. The coordinator derives every order from broker evidence.
+    path = str(STATE_FILE) + ".recovery"
+    incident = {"reason": "STATE_CORRUPTION", "status": "pending"}
+    persist_exit_data(path, incident)
+    client = SurvivorDhanClient(policy=policy)
+    result = client.emergency_flatten_all()
+    if result.flat:
+        persist_exit_data(path, dict(incident, status="broker_verified_flat"))
+    print("Emergency Flatten:", result, "| State accounting unavailable")
+    return 1
+
+
+def _begin_emergency(state, reason):
+    incident = state.get("emergency_recovery", {})
+    if incident.get("status") != "pending":
+        state["emergency_recovery"] = {
+            "id": uuid4().hex, "reason": reason, "status": "pending",
+            "started_at": datetime.now(IST).isoformat(),
+        }
+    active = state.get("active_trade")
+    if active:
+        active.update(flatten_pending=True, flatten_reason=state["emergency_recovery"]["reason"])
+    save_state(state)
+
+
+def _run_emergency(client, state):
+    incident = state["emergency_recovery"]
+    active = state.get("active_trade")
+    reason = incident["reason"]
+    if active and any(_trade_identity(row) == _trade_identity(active) and _journal_proof(row)
+                      for row in _read_exit_journal()):
+        # A crash after the journal write must recheck the registered fills
+        # before either committing risk or allowing another order cycle.
+        if _finalize_closed_trade(client, state, active, reason, emergency=True):
+            return 0
+        _flatten_around_disputed_trade(client, active)
+        print("Flatten INCOMPLETE: persisted closure requires broker verification")
+        return 1
+
+    result = client.emergency_flatten_all()
+    print("Emergency Flatten:", result)
+    if not result.flat:
+        return 1
+    if active:
+        return int(not _finalize_closed_trade(client, state, active, reason, emergency=True))
+    state["emergency_recovery"] = dict(incident, status="verified")
+    save_state(state)
+    return 0
 
 
 def load_state(*, read_only: bool = False) -> Dict:
@@ -462,29 +606,33 @@ def load_state(*, read_only: bool = False) -> Dict:
         "death_timestamp": None,
         "death_reason": None,
     }
-    # Readers can use the snapshot published by the atomic state-file replace.
-    lock_fd = None if read_only else _acquire_state_lock(timeout=5.0)
-    try:
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
-                default_state.update(saved)
-            except Exception as e:
-                logger.error(f"Failed to read state file: {e}")
-    finally:
-        if lock_fd is not None:
-            _release_state_lock(lock_fd)
-    return default_state
+    if read_only:
+        saved, raw = _read_state_storage()
+    else:
+        with _state_transaction():
+            saved, raw = _read_state_storage(quarantine=True)
+    default_state.update(saved)
+    return StateSnapshot(default_state, raw)
 
 
 def save_state(state: Dict) -> None:
-    state["last_heartbeat"] = datetime.now(IST).isoformat()
-    lock_fd = _acquire_state_lock(timeout=5.0)
-    try:
-        persist_exit_data(STATE_FILE, state)
-    finally:
-        _release_state_lock(lock_fd)
+    owned = getattr(_STATE_OWNER, "pid", None) == os.getpid()
+    with _state_transaction():
+        _, raw = _read_state_storage(quarantine=True)
+        if not owned and isinstance(state, StateSnapshot) and state.raw != raw:
+            raise StateUnavailable("State changed since it was loaded")
+        heartbeat = datetime.now(IST).isoformat()
+        persist_exit_data(STATE_FILE, dict(state, last_heartbeat=heartbeat))
+        state["last_heartbeat"] = heartbeat
+        if isinstance(state, StateSnapshot):
+            state.raw = Path(STATE_FILE).read_bytes()
+
+
+def _save_state_update(state, updated):
+    save_state(updated)
+    state.update(updated)
+    if isinstance(state, StateSnapshot):
+        state.raw = updated.raw
 
 
 def load_journal() -> List[Dict]:
@@ -1379,18 +1527,12 @@ def trigger_permanent_coma(client: SurvivorDhanClient, state: Dict, net_equity: 
     4. Emit `[SURVIVOR_SEPUKU_TRIGGERED]` so the parent Hermes agent deletes all scheduled cronjobs.
     """
     logger.critical(f"💀 DEATH FLOOR BREACHED! Net Equity ₹{net_equity:,.2f} <= ₹{DEATH_FLOOR:,.2f}. Executing Permanent Coma...")
-    flatten_actions = client.emergency_flatten_all()
-
     state["status"] = "DEAD_COMA"
     state["current_equity"] = net_equity
     state["death_timestamp"] = datetime.now(IST).isoformat()
     state["death_reason"] = reason
-    if state.get("active_trade"):
-        state["active_trade"]["flatten_pending"] = True
-        state["active_trade"]["flatten_reason"] = "MORTALITY_EXIT"
-        if flatten_actions.flat:
-            _finalize_closed_trade(client, state, state["active_trade"], "MORTALITY_EXIT")
-    save_state(state)
+    _begin_emergency(state, "MORTALITY_EXIT")
+    exit_status = _run_emergency(client, state)
 
     journal = load_journal()
     obituary_lines = [
@@ -1406,11 +1548,8 @@ def trigger_permanent_coma(client: SurvivorDhanClient, state: Dict, net_equity: 
         "",
         "## Emergency Liquidation Actions",
     ]
-    if flatten_actions:
-        for act in flatten_actions:
-            obituary_lines.append(f"- {act}")
-    else:
-        obituary_lines.append("- No open positions or pending orders were active at time of death.")
+    obituary_lines.append("- Emergency liquidation remains pending."
+                          if exit_status else "- Broker confirmed liquidation.")
 
     obituary_lines.extend([
         "",
@@ -1442,7 +1581,7 @@ def trigger_permanent_coma(client: SurvivorDhanClient, state: Dict, net_equity: 
     with open(OBITUARY_FILE, "w", encoding="utf-8") as f:
         f.write(obituary_text)
 
-    return obituary_text, int(not flatten_actions.flat or bool(state.get("active_trade")))
+    return obituary_text, exit_status
 
 
 # ─── Main Execution Modes ──────────────────────────────────────────────────
@@ -1587,14 +1726,14 @@ def _resume_entry(client, state):
         if current:
             if current.get("entry_cycle") != trade["entry_cycle"]:
                 raise ValueError("Entry recovery conflicts with active trade")
-        updated = dict(state, active_trade={**(current or {}), **trade})
+        updated = state.copy()
+        updated["active_trade"] = {**(current or {}), **trade}
         if updated["active_trade"] == current:
             return
         day = datetime.now(IST).date().isoformat()
         if not current and trade["entry_time"][:10] == day:
             updated["daily_trades_count"] = updated.get("daily_trades_count", 0) + 1
-        save_state(updated)
-        state.update(updated)
+        _save_state_update(state, updated)
 
     try:
         return recover_entry(
@@ -1786,7 +1925,7 @@ def _proof_executions(proof):
 
 
 def _finalize_closed_trade(client: Optional[SurvivorDhanClient], state: Dict, active: Dict, reason: str,
-                           *, replay_only: bool = False) -> bool:
+                           *, replay_only: bool = False, emergency: bool = False) -> bool:
     try:
         with exit_lock(EXIT_LEDGER) as ledger:
             journal = _read_exit_journal()
@@ -1804,7 +1943,7 @@ def _finalize_closed_trade(client: Optional[SurvivorDhanClient], state: Dict, ac
             replayable = (proof and not ledger["cycle"] and "replay_check" not in ledger
                           and proof["epoch"] == ledger.get("replay_epoch")
                           and _proof_executions(proof) == ledger.get("replay_executions"))
-            if not replayable:
+            if not replayable or emergency:
                 if replay_only:
                     return False
                 other_proofs = (_journal_proof(row) for row in journal if _trade_identity(row) != identity)
@@ -1813,6 +1952,8 @@ def _finalize_closed_trade(client: Optional[SurvivorDhanClient], state: Dict, ac
                 if fills is None:
                     return False
                 fresh, source = fills
+                if emergency and not fresh:
+                    return False
                 if proof and (not fresh or _proof_executions(fresh) != _proof_executions(proof)):
                     return False
                 if "replay_check" in ledger:
@@ -1827,9 +1968,10 @@ def _finalize_closed_trade(client: Optional[SurvivorDhanClient], state: Dict, ac
                     ledger["replay_executions"] = _proof_executions(fresh)
                     persist_exit_data(EXIT_LEDGER, ledger)
                 if proof:
-                    closed = dict(closed, exit_proof=fresh)
-                    journal[matching[0]] = closed
-                    persist_exit_data(JOURNAL_FILE, journal)
+                    if fresh != proof:
+                        closed = dict(closed, exit_proof=fresh)
+                        journal[matching[0]] = closed
+                        persist_exit_data(JOURNAL_FILE, journal)
                 elif fresh:
                     proof = fresh
                     qty, entry_px, exit_px, gross, net = _closure_amounts(proof)
@@ -1862,8 +2004,9 @@ def _finalize_closed_trade(client: Optional[SurvivorDhanClient], state: Dict, ac
                 _apply_exit_risk(updated, closed, verified)
                 updated["applied_exit_proofs"] = [*applied, identity]
             updated["active_trade"] = None
-            save_state(updated)
-            state.update(updated)
+            if emergency:
+                updated["emergency_recovery"] = dict(state["emergency_recovery"], status="verified")
+            _save_state_update(state, updated)
             if apply_risk:
                 print(f"Trade closed ({closed['exit_reason']}) | {closed['symbol']} | "
                       f"Net: ₹{closed['net_pnl']:+,.2f}")
@@ -1920,6 +2063,20 @@ def _apply_exit_risk(state, active, journal):
                     f"🛡️ Green floor ₹{GREEN_FLOOR_INR:.0f} breached (day peak ₹{_peak_net:+,.2f} -> ₹{today_net_pnl:+,.2f}) — protecting banked profit"
                 )
 
+def _flatten_around_disputed_trade(client, active):
+    # An established contradiction fences the disputed trade while the
+    # coordinator verifies other instruments independently.
+    with exit_lock(EXIT_LEDGER) as ledger:
+        identity = _trade_identity(active)
+        matches = [row for row in _read_exit_journal() if _trade_identity(row) == identity]
+        proof = _journal_proof(matches[0]) if len(matches) == 1 else None
+        scoped = (ledger.get("replay_check") == "contradicted" and proof
+                  and proof["epoch"] == ledger.get("replay_epoch")
+                  and _proof_executions(proof) == ledger.get("replay_executions"))
+    if scoped:
+        client.emergency_flatten_all()
+
+
 def _flatten_trade(client, state, active, reason):
     if active:
         try:
@@ -1934,16 +2091,7 @@ def _flatten_trade(client, state, active, reason):
             if verification_required:
                 if _finalize_closed_trade(client, state, active, reason):
                     return 0
-                # Keep this trade pending while the coordinator checks other instruments.
-                with exit_lock(EXIT_LEDGER) as ledger:
-                    identity = _trade_identity(active)
-                    matches = [row for row in _read_exit_journal() if _trade_identity(row) == identity]
-                    proof = _journal_proof(matches[0]) if len(matches) == 1 else None
-                    scoped = (ledger.get("replay_check") == "contradicted" and proof
-                              and proof["epoch"] == ledger.get("replay_epoch")
-                              and _proof_executions(proof) == ledger.get("replay_executions"))
-                if scoped:
-                    client.emergency_flatten_all()
+                _flatten_around_disputed_trade(client, active)
                 return 1
         except Exception:
             logger.exception("Exit recovery could not persist state")
@@ -2153,6 +2301,17 @@ def _publish_tick_exposure(fd, positions):
 
 
 def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False, owner_fd=None) -> Optional[int]:
+    try:
+        if policy.trade:
+            with _state_transaction():
+                return _tick_with_state(policy=policy, quiet_scan=quiet_scan, owner_fd=owner_fd)
+        return _tick_with_state(policy=policy, quiet_scan=quiet_scan, owner_fd=owner_fd)
+    except OSError as exc:
+        print(f"Tick unavailable: {exc}")
+        return 1
+
+
+def _tick_with_state(*, policy: RolePolicy, quiet_scan: bool, owner_fd):
     """
     Tick body. cmd_tick holds the engine lock for authorized live trading.
     When `quiet_scan=True` (used by `no_agent=True` zero-token cron jobs), routine idle/scan/cooldown
@@ -2169,6 +2328,13 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False,
         return
 
     active = state.get("active_trade")
+    if live and state.get("emergency_recovery", {}).get("status") == "pending":
+        try:
+            client = SurvivorDhanClient(policy=policy)
+        except CachedTokenUnavailable as exc:
+            print(f"Emergency recovery unavailable: {exc}")
+            return 1
+        return _run_emergency(client, state)
     if live and active:
         try:
             if _finalize_closed_trade(None, state, active, "RESTART_EXIT_RECOVERY", replay_only=True):
@@ -2545,7 +2711,15 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False,
 
 def cmd_reconcile(*, policy: Optional[RolePolicy] = None) -> None:
     """Reconcile recorded trades using individually verified order fills."""
+    with _state_transaction():
+        return _reconcile_with_state(policy)
+
+
+def _reconcile_with_state(policy):
     state = load_state()
+    if state.get("emergency_recovery", {}).get("status") == "pending":
+        print("Reconciliation deferred pending emergency recovery")
+        return 1
     if state.get("active_trade"):
         print("Reconciliation deferred pending active trade recovery")
         return
@@ -2630,6 +2804,13 @@ def cmd_premarket(*, policy: Optional[RolePolicy] = None) -> None:
     Repair requires premarket --live --repair and SURVIVOR_LIVE_TRADING=1.
     """
     policy = policy if policy is not None else _resolve_role("premarket")
+    if policy.repair_ip:
+        with _state_transaction():
+            return _premarket_with_state(policy)
+    return _premarket_with_state(policy)
+
+
+def _premarket_with_state(policy):
     allow_repair = policy.repair_ip
     state = load_state(read_only=not allow_repair)
     if not allow_repair:
@@ -2733,7 +2914,7 @@ def cmd_premarket(*, policy: Optional[RolePolicy] = None) -> None:
     print("=" * 68)
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Dhan Survivor Autonomous Trading Organism")
     parser.add_argument("action", choices=["status", "premarket", "tick", "reconcile", "flatten", "eod-alerts", "simulate-coma-test"], help="Action to run")
     parser.add_argument("--live", action="store_true", help="Enable the requested live action")
@@ -2755,7 +2936,7 @@ if __name__ == "__main__":
         if cmd_tick(quiet_scan=args.quiet, policy=policy):
             sys.exit(1)
     elif args.action == "reconcile":
-        cmd_reconcile(policy=policy)
+        return cmd_reconcile(policy=policy)
     elif args.action == "flatten":
         if not policy.flatten:
             parser.error("flatten requires --live and SURVIVOR_LIVE_TRADING=1")
@@ -2769,3 +2950,12 @@ if __name__ == "__main__":
         tier_test = get_survival_tier(3250.0)
         assert tier_test["tier"] == "DEAD", f"Expected DEAD tier, got {tier_test}"
         print("✅ Mortality threshold check verified: ₹3,250.00 <= ₹3,300.00 triggers DEAD_COMA.")
+
+
+if __name__ == "__main__":
+    try:
+        if main():
+            sys.exit(1)
+    except StateUnavailable as exc:
+        print(str(exc))
+        sys.exit(1)
