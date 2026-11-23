@@ -49,55 +49,50 @@ legacy executable and backtest modules, including the legacy fee simulator and
 the reporter that imports `live_trader`. Credentials, real market metadata,
 production state, logs and installed dependencies are outside the archives.
 
-## Entry protections
+## Architecture decisions
 
-The operator approved the deployed IST windows of 09:30–11:30 and
-13:30–14:15, inclusive at minute precision, and the deployed equity CHOPPY
-filter. The candidate shares the time gate across scan, submission preflight
-and entry chase. The equity scanner checks regime before selecting either
-direction, and order preflight checks the selected regime again. The operator
-patch is recorded with its tests. The remaining live-to-candidate edits in the
-tick and equity scanner scopes still require review.
+| Decision | Staging evidence and limits |
+| --- | --- |
+| Status is read-only | Guard card `t_93df9573` resolves status to read-only. Status reads persisted state and reports a death-floor breach without writing state or placing orders. `test_role_permissions.test_status_at_floor` covers the floor path. The new incident display in `cmd_status` still needs direct QA. |
+| Mortality requires an available authorized live tick | State-changing mortality runs through a tick with trading permission and available broker equity evidence. Status and dry tick can report the breach. `test_role_permissions` covers authorized live tick, dry tick and a live request with activation disabled using mocked equity. Actual authorized tick availability was outside this source review. |
+| Quote outage persists an incident and uses no candle fallback | `6fabddd` persists and alerts on `QUOTE_UNAVAILABLE`. Broker position and stop checks and the EOD path continue. Price-driven actions wait for a validated quote for the affected instrument. A pending incident also fences new entries after position closure until the quote is validated. The outage cases in `test_preflight.py` cover missing, stale and malformed quotes, restart and the entry fence. |
+| Option entry uses verified broker LTP and a bounded chase | `6c22302` computes the chase cap in decimal and rechecks order and exposure after reading the quote. `test_operator_option_pricing.py` covers one amendment at the 1.5% cap on the original order, cancellation above the cap, and reconciliation when a partial fill appears during the quote read. |
+| Restore time-of-day and equity CHOPPY protections | `85296d1` ports the operator-approved windows of 09:30–11:30 and 13:30–14:15 IST, inclusive at minute precision. Scan, submission and chase share the time gate. Equity scan checks CHOPPY before either direction is selected, and submission preflight rechecks the selected regime. `test_entry_release_parity.py` covers window, scan and submission behavior. |
 
 ## Source provenance
 
-`release/source-provenance.json` records the reviewed source pairs, staging
-cards and full commit IDs, and the pinned QA assertions. `parity.json`
-includes raw and CRLF-normalized SHA-256 digests of both inspected sources,
-the normalized line diff, and the full qualified function inventory for all
-five modules. The inventory includes added, removed and unchanged functions,
-methods, nested functions and a `<module>` row for source outside functions.
-A nested function also appears within its enclosing function's source span.
-The recorded staging history identifies each scope version by hash. The
-`deployed_matches_staging_baseline` flag distinguishes actual equality with
-the source-only staging base from scopes that already differed there.
+`release/source-provenance.json` pins the deployed application bytes and
+candidate application source at `6c223027251f5d1296c9e43c515384d3c4254607`.
+It records each changed qualified scope, staging cards and commits,
+rationale, and QA references with test file hashes. `parity.json` includes
+the raw and CRLF-normalized source digests, normalized line diff and full
+qualified scope inventory. The inventory includes added, removed and
+unchanged scopes and a `<module>` row for source outside functions. Nested
+functions also appear in their enclosing function's source span.
+`deployed_matches_staging_baseline` records equality with the source-only
+staging base where applicable.
 
-A scope is intentional only when the inspected source pair and scope match
-the ledger and the named regression assertions match the exported test
-source. The offline suite must also pass for release. A related staging
-commit or QA case can be recorded on an unreviewed scope as a lead.
-`subdelta_review` records the exact operator port for the scanner and tick
-separately from the full scope verdict. Outstanding scopes are enumerated
-under each module's `unreviewed_scopes` list and block the gate.
+The source diagnostic checks exact module and scope hashes and checks each
+referenced test file and method against the candidate export payload.
+`subdelta_review` records focused decisions for the time-of-day and CHOPPY
+port, the quote incident, the option chase fix and token publication after
+persistence. Unreviewed scopes still block the gate. The [source review
+diagnostic](source-review-diagnostic.md) lists their exact names.
 
-- `cloud_guard.py` retains pending adapter surface review for the dedicated
-  exit method and module-level capability declarations.
-- `cloud_probe.py` is outside both archives. The one-line cache-only broker
-  constructor change maps to `e67e554`. The pinned regressions cover the
-  client directly. The standalone probe change remains unreviewed.
-- `dhan_broker.py` traces to the guard source commits. Exact coverage gaps
-  include the cache expiry margin, atomic replacement and exceptional cleanup,
-  renewal retry semantics and the loader return value and exclusions.
-- `risk_manager.py` is a retired legacy simulator outside both archives.
-  Its two fee-subtraction edits are recorded under
-  `TradeSimulator.run_backtest`. Independent QA reproduced the undefined
-  deployed fee constant. Retirement keeps the simulator outside the gate's
-  supported runtime and rollback scopes.
-- `survivor_engine.py` maps the remaining drift to the committed guard,
-  exit, EOD, entry, recovery, preflight, reconcile and harness evidence, plus
-  the operator patch. The release gate stays blocked on unresolved integration
-  scopes, including the replaced tick path, closure fallback and the removal
-  of the deployed `state_transaction` helper.
+The standalone `cloud_probe.py` constructor change maps to `e67e554` and
+has checkout-only CLI evidence in `test_cloud_probe_cli.py`. The application
+probe is outside both archives, while the candidate export includes its
+test file. Executing those cases requires a source checkout containing
+the probe. The exported suite and rollback exercise were outside this
+source-only diagnostic. The focused checkout run is recorded in
+[operator regressions](operator-regressions.md).
+
+The mixed guard declarations, token cache and refresh paths, and engine
+integration scopes retain open decisions where the tests cover only part
+of the behavior. The deployed `state_transaction` helper is absent from
+the source-only staging base and has no direct removal approval.
+`risk_manager.py` remains a retired simulator outside both archives.
+Independent QA reproduced its undefined deployed fee constant.
 
 ## Scratch rollback gate
 

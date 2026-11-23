@@ -28,9 +28,9 @@ in decimal, and repeats the order and exposure check after the quote read.
 All 12 focused cases passed under the socket-denied runner. Approved tests
 and source adjudications received no edits.
 
-The probe test lives alongside the release harness because the current
-candidate and rollback archives exclude the standalone probe. It was
-executed separately in the focused scratch run.
+The probe test is in `tests/test_cloud_probe_cli.py`. Its standalone CLI
+checks run against the staging checkout because the source archives exclude
+the standalone probe; the focused socket-denied checkout run passed 3/3.
 
 ## Coverage boundaries
 

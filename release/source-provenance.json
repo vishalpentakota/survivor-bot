@@ -9,7 +9,11 @@
           "qa": [
             "test_write_safety.test_cached_absent",
             "test_write_safety.test_authorized_reconnect",
-            "test_migration.test_live_flag_passes_writes"
+            "test_migration.test_live_flag_passes_writes",
+            "test_operator_guard_client.test_read_only_exit_method_is_denied_even_with_live_switch",
+            "test_cloud_probe_cli.test_default_cli_only_reads_public_ip",
+            "test_cloud_probe_cli.test_broker_cli_reads_using_cache_only_under_live_switch",
+            "test_cloud_probe_cli.test_broker_cli_without_cache_stops_before_sdk_and_dhan_http"
           ],
           "rationale": "Declare the frozen invocation capability type, the read-only default and explicit broker method sets.",
           "reason": "Class defaults, method allowlists and import-time READ_ONLY are grouped with module metadata. The final test-only commit supplies CLI outcomes but no exhaustive adapter surface assertion.",
@@ -18,7 +22,8 @@
             "deployed": "cc2b08ff62a2f84513165b58c03165253cf0157d835c1a8f76b1569645619b02"
           },
           "sources": [
-            "guard"
+            "guard",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -153,22 +158,25 @@
         },
         "ReadOnlyBroker._place_exit_order": {
           "candidate_matches_last_staging_version": true,
-          "decision": "unreviewed",
+          "decision": "intentional",
           "deployed_matches_staging_baseline": true,
           "qa": [
             "test_write_safety.test_flatten_requires_live",
             "test_write_safety.test_authorized_reconnect",
-            "test_verified_exits.test_authorized_cli_unresolved_is_nonzero_then_verified_flat_succeeds"
+            "test_verified_exits.test_authorized_cli_unresolved_is_nonzero_then_verified_flat_succeeds",
+            "test_operator_guard_client.test_read_only_exit_method_is_denied_even_with_live_switch",
+            "test_operator_guard_client.test_authorized_flatten_waits_for_orders_and_position_to_agree"
           ],
           "rationale": "Restrict dedicated exit submission to a trade or flatten role.",
-          "reason": "Authorized exit flows exercise the verified coordinator. There is no pinned assertion for direct permission denial and every capability combination on this adapter method.",
+          "reason": "Explicit read-only policy denies the direct adapter call. Authorized flatten submits only after converged broker proof and replay adds no order.",
           "sha256": {
             "candidate": "cf5b7ff3c686d68de0cce2925fa195af8a193a22a01998ff2dcb39c97876b0c7",
             "deployed": null
           },
           "sources": [
             "guard",
-            "exits"
+            "exits",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -245,19 +253,23 @@
       "scopes": {
         "<module>": {
           "candidate_matches_last_staging_version": true,
-          "decision": "unreviewed",
+          "decision": "intentional",
           "deployed_matches_staging_baseline": true,
           "qa": [
-            "test_write_safety.test_contended_expired_absent"
+            "test_write_safety.test_contended_expired_absent",
+            "test_cloud_probe_cli.test_default_cli_only_reads_public_ip",
+            "test_cloud_probe_cli.test_broker_cli_reads_using_cache_only_under_live_switch",
+            "test_cloud_probe_cli.test_broker_cli_without_cache_stops_before_sdk_and_dhan_http"
           ],
           "rationale": "Pass explicit cache-only and no-order-write flags through the standalone broker probe.",
-          "reason": "Exact one-line e67e554 change. Independent historical probe QA covered API failure propagation before this patch, and the staging role tests exercise the client directly. No pinned regression executes this exact final probe path.",
+          "reason": "The exact e67e554 constructor change has checkout-only CLI evidence for cache-only broker reads, write-free operation and failure before SDK construction on cache miss.",
           "sha256": {
             "candidate": "b484066d40f10312b77e47f6cea51951b56cd927593b387b92e691f5162c4f53",
             "deployed": "86c5c9ae818cd60dacf85975afd7da007ace0e08bf34b13ef1f49902c0ea5fc8"
           },
           "sources": [
-            "guard"
+            "guard",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -317,20 +329,23 @@
         },
         "DhanTokenManager.__init__": {
           "candidate_matches_last_staging_version": true,
-          "decision": "unreviewed",
+          "decision": "intentional",
           "deployed_matches_staging_baseline": true,
           "qa": [
             "test_role_permissions.test_status_missing_or_expired_cache",
-            "test_write_safety.test_contended_expired_absent"
+            "test_write_safety.test_contended_expired_absent",
+            "test_operator_guard_client.test_read_only_uses_near_expiry_cache_and_denies_at_expiry",
+            "test_operator_guard_client.test_refresh_failure_cleans_lock_and_can_retry"
           ],
           "rationale": "Use cached tokens only for read-only clients and fail before renewal if the cache is unusable.",
-          "reason": "Named QA covers the indicated path. Exact regression coverage for the whole live-to-candidate scope has not been established.",
+          "reason": "Default construction binds read-only renewal policy; passing authorized policy changes cache margin and allows refresh.",
           "sha256": {
             "candidate": "eb0ebd21d132efe21fc26cd338c3e6d5e786bf580aa59312cf2b96a0acaaaac0",
             "deployed": "4d6a04a461eac4eb47282620ab6ffcbd3b7ac06af86c2959e83aa0a1aaff4bb0"
           },
           "sources": [
-            "guard"
+            "guard",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -356,16 +371,19 @@
           "deployed_matches_staging_baseline": true,
           "qa": [
             "test_role_permissions.test_status_missing_or_expired_cache",
-            "test_write_safety.test_contended_expired_absent"
+            "test_write_safety.test_contended_expired_absent",
+            "test_operator_guard_client.test_read_only_uses_near_expiry_cache_and_denies_at_expiry",
+            "test_operator_guard_client.test_refresh_failure_cleans_lock_and_can_retry"
           ],
           "rationale": "Use cached tokens only for read-only clients and fail before renewal if the cache is unusable.",
-          "reason": "Cache tests cover valid and expired reads, but many stub cache loading. No pinned assertion isolates the zero versus one-hour margin and reset of both stale attributes.",
+          "reason": "Near-expiry read-only cache and the renewal margin have direct coverage. Reset of both attributes on a reload without cache data lacks a direct assertion.",
           "sha256": {
             "candidate": "32a34e33f886a0256d47072f92b28b2428b89e5650ab3b39ed19e2da281af0c4",
             "deployed": "d528c9db5b919e0d81acdc6e1edeb20996b4ee6f79b7c78c50a82301ad0adc64"
           },
           "sources": [
-            "guard"
+            "guard",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -391,16 +409,19 @@
           "deployed_matches_staging_baseline": true,
           "qa": [
             "test_write_safety.test_contended_expired_absent",
-            "test_write_safety.test_authorized_reconnect"
+            "test_write_safety.test_authorized_reconnect",
+            "test_operator_guard_client.test_refresh_failure_cleans_lock_and_can_retry",
+            "test_operator_guard_client.test_failed_atomic_replacement_preserves_current_token_and_retries"
           ],
           "rationale": "Guard renewals, serialize refresh attempts and write token cache atomically.",
-          "reason": "Contention assertions exercise some paths. Forced refresh, stale lock and exceptional cleanup lack exact assertions.",
+          "reason": "Lock cleanup and retry after mocked renewal and replacement failures are covered. Contention branches lack direct assertions for all cache outcomes.",
           "sha256": {
             "candidate": "fbbaf6e53cdb7efd2c27d5e1d6d669631043d33d7d0f5679b3900b14c062515a",
             "deployed": null
           },
           "sources": [
-            "guard"
+            "guard",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -411,21 +432,55 @@
           ]
         },
         "DhanTokenManager._renew_token": {
+          "approved_subdeltas": [
+            {
+              "commit": "6c223027251f5d1296c9e43c515384d3c4254607",
+              "from_sha256": "c471f26d73c52f264f4d8403c2b0faa6160e01054c08048b2a0a1e76669e701b",
+              "qa": [
+                "test_operator_guard_client.test_failed_atomic_replacement_preserves_current_token_and_retries"
+              ],
+              "reason": "Publish the replacement token and expiry only after atomic persistence succeeds.",
+              "source": "operator_regressions",
+              "staging_to_candidate_diff": [
+                "--- 6fabddd8dda31e8363ee4548c9d6a7fa9b3cd175\n",
+                "+++ 6c223027251f5d1296c9e43c515384d3c4254607\n",
+                "@@ -26,10 +26,11 @@\n",
+                "                     token_data = response.json()\n",
+                " \n",
+                "                     if response.status_code == 200:\n",
+                "-                        self.access_token = token_data.get(\"accessToken\") or token_data.get(\"access_token\")\n",
+                "-                        if self.access_token:\n",
+                "-                            self.token_expiry = datetime.now() + timedelta(hours=23)\n",
+                "-                            self._save_state()\n",
+                "+                        access_token = token_data.get(\"accessToken\") or token_data.get(\"access_token\")\n",
+                "+                        if access_token:\n",
+                "+                            expiry = datetime.now() + timedelta(hours=23)\n",
+                "+                            self._save_state(replacement=(access_token, expiry))\n",
+                "+                            self.access_token, self.token_expiry = access_token, expiry\n",
+                "                             logger.info(f\"Token renewed successfully. Expires: {self.token_expiry}\")\n",
+                "                             logger.info(f\"Account: {token_data.get('dhanClientName', 'N/A')} ({token_data.get('dhanClientId', 'N/A')})\")\n",
+                "                             return self.access_token\n"
+              ],
+              "to_sha256": "0aa7a33f62d7f2f70bf80f9e301a8e1ae1320e904dbabf6c84720e372d4c6619"
+            }
+          ],
           "candidate_matches_last_staging_version": true,
           "decision": "unreviewed",
           "deployed_matches_staging_baseline": true,
           "qa": [
             "test_write_safety.test_contended_expired_absent",
-            "test_write_safety.test_authorized_reconnect"
+            "test_write_safety.test_authorized_reconnect",
+            "test_operator_guard_client.test_failed_atomic_replacement_preserves_current_token_and_retries"
           ],
           "rationale": "Guard renewals, serialize refresh attempts and write token cache atomically.",
-          "reason": "Renewal is stubbed for guard QA. Removing the retry-loop disk recheck needs distinct evidence.",
+          "reason": "Persistence-before-publication is tested. Removal of the retry-loop disk recheck under provider failure remains unreviewed.",
           "sha256": {
-            "candidate": "c471f26d73c52f264f4d8403c2b0faa6160e01054c08048b2a0a1e76669e701b",
+            "candidate": "0aa7a33f62d7f2f70bf80f9e301a8e1ae1320e904dbabf6c84720e372d4c6619",
             "deployed": "beaa64bea18eba627c85ce0d0021cc72e4d4293f052947881cca909f3f5fe741"
           },
           "sources": [
-            "guard"
+            "guard",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -437,6 +492,11 @@
               "after_sha256": "c471f26d73c52f264f4d8403c2b0faa6160e01054c08048b2a0a1e76669e701b",
               "before_sha256": "beaa64bea18eba627c85ce0d0021cc72e4d4293f052947881cca909f3f5fe741",
               "commit": "32981fc7a268db8b33dfb02ce30ee4f91f821a0c"
+            },
+            {
+              "after_sha256": "0aa7a33f62d7f2f70bf80f9e301a8e1ae1320e904dbabf6c84720e372d4c6619",
+              "before_sha256": "c471f26d73c52f264f4d8403c2b0faa6160e01054c08048b2a0a1e76669e701b",
+              "commit": "6c223027251f5d1296c9e43c515384d3c4254607"
             }
           ]
         },
@@ -467,20 +527,23 @@
         },
         "DhanTokenManager._save_state": {
           "candidate_matches_last_staging_version": true,
-          "decision": "unreviewed",
+          "decision": "intentional",
           "deployed_matches_staging_baseline": true,
           "qa": [
             "test_write_safety.test_contended_expired_absent",
-            "test_write_safety.test_authorized_reconnect"
+            "test_write_safety.test_authorized_reconnect",
+            "test_operator_guard_client.test_read_only_uses_near_expiry_cache_and_denies_at_expiry",
+            "test_operator_guard_client.test_failed_atomic_replacement_preserves_current_token_and_retries"
           ],
-          "rationale": "Guard renewals, serialize refresh attempts and write token cache atomically.",
-          "reason": "Deny tests assert no writes and the guard matrix records success writes. The exact replacement and failure cleanup behavior is not asserted.",
+          "rationale": "Persist token replacement through a temporary file before publishing new in-memory state.",
+          "reason": "Require renewal permission and write the proposed token via atomic replacement. Mocked replacement failure removes the temporary file and retry persists the exact token and expiry.",
           "sha256": {
-            "candidate": "f144e74bcb82192d937a51f8ac3b007c0899d8e390079f4e4d4a660b7c3057c0",
+            "candidate": "d5252f0b7a1395d330eabbb9e789ac0cf044ea6f676d7ebf4bd6ef5eea2fe72a",
             "deployed": "cf5d5931b3ae834016a51f0524f5e698331f1ba00b961854cdb4d095eb7de651"
           },
           "sources": [
-            "guard"
+            "guard",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -492,25 +555,33 @@
               "after_sha256": "f144e74bcb82192d937a51f8ac3b007c0899d8e390079f4e4d4a660b7c3057c0",
               "before_sha256": "cf5d5931b3ae834016a51f0524f5e698331f1ba00b961854cdb4d095eb7de651",
               "commit": "32981fc7a268db8b33dfb02ce30ee4f91f821a0c"
+            },
+            {
+              "after_sha256": "d5252f0b7a1395d330eabbb9e789ac0cf044ea6f676d7ebf4bd6ef5eea2fe72a",
+              "before_sha256": "f144e74bcb82192d937a51f8ac3b007c0899d8e390079f4e4d4a660b7c3057c0",
+              "commit": "6c223027251f5d1296c9e43c515384d3c4254607"
             }
           ]
         },
         "DhanTokenManager.allow_renewal": {
           "candidate_matches_last_staging_version": true,
-          "decision": "unreviewed",
+          "decision": "intentional",
           "deployed_matches_staging_baseline": true,
           "qa": [
             "test_role_permissions.test_status_missing_or_expired_cache",
-            "test_write_safety.test_contended_expired_absent"
+            "test_write_safety.test_contended_expired_absent",
+            "test_operator_guard_client.test_read_only_uses_near_expiry_cache_and_denies_at_expiry",
+            "test_operator_guard_client.test_refresh_failure_cleans_lock_and_can_retry"
           ],
           "rationale": "Use cached tokens only for read-only clients and fail before renewal if the cache is unusable.",
-          "reason": "Named QA covers the indicated path. Exact regression coverage for the whole live-to-candidate scope has not been established.",
+          "reason": "Renewal permission is read from the invocation policy; tests cover both default denial and authorized refresh.",
           "sha256": {
             "candidate": "d83293194beaa9104f1ebe43639a506dce782852a7d10c574354ba202a218185",
             "deployed": null
           },
           "sources": [
-            "guard"
+            "guard",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -562,20 +633,23 @@
         },
         "DhanTokenManager.renew_token": {
           "candidate_matches_last_staging_version": true,
-          "decision": "unreviewed",
+          "decision": "intentional",
           "deployed_matches_staging_baseline": true,
           "qa": [
             "test_write_safety.test_contended_expired_absent",
-            "test_write_safety.test_authorized_reconnect"
+            "test_write_safety.test_authorized_reconnect",
+            "test_operator_guard_client.test_read_only_uses_near_expiry_cache_and_denies_at_expiry",
+            "test_operator_guard_client.test_failed_atomic_replacement_preserves_current_token_and_retries"
           ],
           "rationale": "Guard renewals, serialize refresh attempts and write token cache atomically.",
-          "reason": "Authorized reconnect is exercised with a mocked refresh path. The forced-refresh semantics lack a pinned assertion.",
+          "reason": "Forced renewal bypasses a valid cache when authorized and denies a read-only request before locking.",
           "sha256": {
             "candidate": "fb221097ae78c52da7ea435dccb4807b5852424c0817f03cb67738248e7777f1",
             "deployed": null
           },
           "sources": [
-            "guard"
+            "guard",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -587,20 +661,22 @@
         },
         "load_env_file": {
           "candidate_matches_last_staging_version": true,
-          "decision": "unreviewed",
+          "decision": "intentional",
           "deployed_matches_staging_baseline": true,
           "qa": [
             "test_write_safety.test_flatten_requires_live",
-            "test_write_safety.test_authorized_premarket_repairs_with_mocks"
+            "test_write_safety.test_authorized_premarket_repairs_with_mocks",
+            "test_operator_guard_client.test_env_loader_precedence_and_return_value"
           ],
           "rationale": "Parse the switch independently from ordinary .env keys and resolve CLI-only capabilities.",
-          "reason": "Guard matrix covers live-switch precedence. Exported write-safety tests mock this loader. No pinned assertion covers the return value and exclude behavior.",
+          "reason": "Return parsed values including exclusions and keep the process switch authoritative, with a file fallback and an empty mapping for a missing file.",
           "sha256": {
             "candidate": "645528ac17e898da06197bb8d3ace1f89e410918b8ba7fde0578057335503e25",
             "deployed": "f624e56273a8d450055f155da29c022f820dff3ef52903562b58da47f451c4a7"
           },
           "sources": [
-            "guard"
+            "guard",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -617,7 +693,7 @@
         }
       },
       "source_sha256": {
-        "candidate": "8d49bc0e7a7b04438c7def6c77ad45d7c6d365bd475edf81e733f1d7a9fb148e",
+        "candidate": "2287bc1c9fa1611313e6f14d5dfddaffa0de8607fcffe031e1cb452890836543",
         "deployed": "288e4490181812d26974f54a4917f26a2b461ced434689f514d4f7ee88772a17"
       }
     },
@@ -668,7 +744,7 @@
           "rationale": "Wire staging components into the engine module, role dispatch and classes.",
           "reason": "Mixed imports, constants, class setup, comments and CLI dispatch. The listed QA covers integrated paths, without an exhaustive proof of the live-to-staging integration and all residual module edits.",
           "sha256": {
-            "candidate": "be3668147dd88d71c682363b174a2de2d38a15c16cd0ce976dcbb3eeaaae43f5",
+            "candidate": "618a261c570167a19e478ad3b04e33233ed40a4a33f5b03bbf1ceba9888a1802",
             "deployed": "1a667fd7351976aa931a861ef61e5cf731ab28bbccf55bfb0dacb0fd8d26c63a"
           },
           "sources": [
@@ -677,7 +753,9 @@
             "eod",
             "recovery",
             "preflight",
-            "reconcile"
+            "reconcile",
+            "quote_outage",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -734,6 +812,16 @@
               "after_sha256": "be3668147dd88d71c682363b174a2de2d38a15c16cd0ce976dcbb3eeaaae43f5",
               "before_sha256": "3709f2d415215b3d1f20a3a1e0fc0de52becb8c845814f22e417b2c757b39c3f",
               "commit": "afb1279d2c9a27686c9e2e92555437b824e73896"
+            },
+            {
+              "after_sha256": "c84267fc921d07f324a6a703f6f0fc03ea66d76b2d58e9edda2209258a164909",
+              "before_sha256": "be3668147dd88d71c682363b174a2de2d38a15c16cd0ce976dcbb3eeaaae43f5",
+              "commit": "6fabddd8dda31e8363ee4548c9d6a7fa9b3cd175"
+            },
+            {
+              "after_sha256": "618a261c570167a19e478ad3b04e33233ed40a4a33f5b03bbf1ceba9888a1802",
+              "before_sha256": "c84267fc921d07f324a6a703f6f0fc03ea66d76b2d58e9edda2209258a164909",
+              "commit": "6c223027251f5d1296c9e43c515384d3c4254607"
             }
           ]
         },
@@ -1361,6 +1449,32 @@
             }
           ]
         },
+        "_alert_quote_outage": {
+          "candidate_matches_last_staging_version": true,
+          "decision": "intentional",
+          "deployed_matches_staging_baseline": true,
+          "qa": [
+            "test_preflight.test_missing_quote_persists_incident_without_price_actions",
+            "test_preflight.test_stale_target_quote_persists_incident_without_price_actions",
+            "test_preflight.test_malformed_quote_persists_incident_without_price_actions"
+          ],
+          "rationale": "Alert on a persisted QUOTE_UNAVAILABLE incident and describe the hold on new entries.",
+          "reason": "Alert on a persisted QUOTE_UNAVAILABLE incident and describe the hold on new entries.",
+          "sha256": {
+            "candidate": "f073213f7b7abdfcc7c8c5ae5fd2ed12ce420f01d11b3be1156fbb77516e1b40",
+            "deployed": null
+          },
+          "sources": [
+            "quote_outage"
+          ],
+          "staging_history": [
+            {
+              "after_sha256": "f073213f7b7abdfcc7c8c5ae5fd2ed12ce420f01d11b3be1156fbb77516e1b40",
+              "before_sha256": null,
+              "commit": "6fabddd8dda31e8363ee4548c9d6a7fa9b3cd175"
+            }
+          ]
+        },
         "_apply_exit_risk": {
           "candidate_matches_last_staging_version": true,
           "decision": "unreviewed",
@@ -1532,6 +1646,31 @@
             }
           ]
         },
+        "_clear_quote_outage": {
+          "candidate_matches_last_staging_version": true,
+          "decision": "intentional",
+          "deployed_matches_staging_baseline": true,
+          "qa": [
+            "test_preflight.test_pending_quote_incident_survives_restart_until_validated_quote",
+            "test_preflight.test_pending_quote_incident_blocks_entry_after_position_closes"
+          ],
+          "rationale": "Remove the incident from persisted and in-memory state after verified quote recovery.",
+          "reason": "Remove the incident from persisted and in-memory state after verified quote recovery.",
+          "sha256": {
+            "candidate": "ff98a184791bc624358af9c4ca0539a3ecce8f66dc3a4a144fdea754669dc55d",
+            "deployed": null
+          },
+          "sources": [
+            "quote_outage"
+          ],
+          "staging_history": [
+            {
+              "after_sha256": "ff98a184791bc624358af9c4ca0539a3ecce8f66dc3a4a144fdea754669dc55d",
+              "before_sha256": null,
+              "commit": "6fabddd8dda31e8363ee4548c9d6a7fa9b3cd175"
+            }
+          ]
+        },
         "_closure_amounts": {
           "candidate_matches_last_staging_version": true,
           "decision": "unreviewed",
@@ -1695,6 +1834,40 @@
           ]
         },
         "_entry_chase": {
+          "approved_subdeltas": [
+            {
+              "commit": "6c223027251f5d1296c9e43c515384d3c4254607",
+              "from_sha256": "1b96ebefbb3232099324e3fc218b73174ea61268edd19e79c1c17578ee36640f",
+              "qa": [
+                "test_operator_option_pricing.test_option_chase_uses_verified_ltp_and_caps_one_amendment",
+                "test_operator_option_pricing.test_option_ltp_beyond_cap_cancels_original_without_replacement",
+                "test_operator_option_pricing.test_option_partial_during_chase_quote_cancels_then_closes_only_residual"
+              ],
+              "reason": "Apply an exact decimal chase cap and reconcile changed order or exposure after fetching the fresh quote.",
+              "source": "operator_regressions",
+              "staging_to_candidate_diff": [
+                "--- 6fabddd8dda31e8363ee4548c9d6a7fa9b3cd175\n",
+                "+++ 6c223027251f5d1296c9e43c515384d3c4254607\n",
+                "@@ -6,11 +6,12 @@\n",
+                "     security = str(trade[\"security_id\"])\n",
+                "     exchange = trade[\"exchange_segment\"]\n",
+                "     instrument_type = trade[\"instrument_type\"]\n",
+                "-    if coordinator.snapshot() != (book, exposure):\n",
+                "-        return False\n",
+                "     fresh = _get_latest_tick_ltp(client, security, exchange, instrument_type)\n",
+                "     tick = trade[\"tick_size\"]\n",
+                "-    cap = round_tick(limit * (1 + MAX_ENTRY_CHASE_PCT), tick, floor=True)\n",
+                "+    cap = round_tick(Decimal(str(limit)) * (1 + Decimal(str(MAX_ENTRY_CHASE_PCT))), tick, floor=True)\n",
+                "+    if coordinator.snapshot() != (book, exposure):\n",
+                "+        # Reconcile the changed order or exposure before attempting an amendment or cancel.\n",
+                "+        return True\n",
+                "     if not fresh or not limit < fresh <= cap:\n",
+                "         return False\n",
+                "     price = min(cap, round_tick(fresh * 1.005, tick))\n"
+              ],
+              "to_sha256": "0a62d4e3cd1d3737466e56fc091f482a48ef100044039c3f2454e387736bb7d8"
+            }
+          ],
           "candidate_matches_last_staging_version": true,
           "decision": "unreviewed",
           "deployed_matches_staging_baseline": true,
@@ -1704,18 +1877,22 @@
             "test_entry_protection.test_restart_after_atomic_active_trade_publication",
             "test_entry_protection.test_monitor_rejection_retains_price_then_retries_confirmed_amendment_once",
             "test_preflight.test_unverified_price_blocks_entry_and_chase",
-            "test_safe_behavior.test_p2_partial_fill_sizes_sl_and_journal_to_filled_qty"
+            "test_safe_behavior.test_p2_partial_fill_sizes_sl_and_journal_to_filled_qty",
+            "test_operator_option_pricing.test_option_chase_uses_verified_ltp_and_caps_one_amendment",
+            "test_operator_option_pricing.test_option_ltp_beyond_cap_cancels_original_without_replacement",
+            "test_operator_option_pricing.test_option_partial_during_chase_quote_cancels_then_closes_only_residual"
           ],
           "rationale": "Replace legacy entry and protection flows with durable intents, preserve cutoff, confirm protection and amendment evidence.",
-          "reason": "7ae4713 denies unverified quote and market conditions; the current strategy QA stubs the downstream coordinator at submission and does not directly drive a real chase through both windows.",
+          "reason": "Verified option LTP, exact cap, one amendment and reconciliation after a fill during quote retrieval have direct coverage. Full scope review still lacks chase-specific cutoff and mutation-denial assertions.",
           "sha256": {
-            "candidate": "1b96ebefbb3232099324e3fc218b73174ea61268edd19e79c1c17578ee36640f",
+            "candidate": "0a62d4e3cd1d3737466e56fc091f482a48ef100044039c3f2454e387736bb7d8",
             "deployed": null
           },
           "sources": [
             "entry",
             "preflight",
-            "harness"
+            "harness",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -1732,11 +1909,16 @@
               "after_sha256": "1b96ebefbb3232099324e3fc218b73174ea61268edd19e79c1c17578ee36640f",
               "before_sha256": "86be743858e03144214472452b36e5e2f7c320c0e08a728748e315d739d80c8a",
               "commit": "7ae4713c7c9375a0bc04ed7463248b2441487679"
+            },
+            {
+              "after_sha256": "0a62d4e3cd1d3737466e56fc091f482a48ef100044039c3f2454e387736bb7d8",
+              "before_sha256": "1b96ebefbb3232099324e3fc218b73174ea61268edd19e79c1c17578ee36640f",
+              "commit": "6c223027251f5d1296c9e43c515384d3c4254607"
             }
           ]
         },
         "_entry_market_open": {
-          "candidate_matches_last_staging_version": false,
+          "candidate_matches_last_staging_version": true,
           "decision": "intentional",
           "deployed_matches_staging_baseline": true,
           "qa": [
@@ -1763,6 +1945,11 @@
               "after_sha256": "248d6c4f8fc83a0b92d93c6d4678e1b3838e34d9dc4ab114a1348122fadbd410",
               "before_sha256": null,
               "commit": "7ae4713c7c9375a0bc04ed7463248b2441487679"
+            },
+            {
+              "after_sha256": "5c0f294baaeb50d0207603b0dd490376874d3b21d83f41f9f13e9468e74e40f9",
+              "before_sha256": "248d6c4f8fc83a0b92d93c6d4678e1b3838e34d9dc4ab114a1348122fadbd410",
+              "commit": "85296d115c87bb02d384cd0da5d859ae123b18ea"
             }
           ]
         },
@@ -1803,7 +1990,7 @@
           ]
         },
         "_entry_window_open": {
-          "candidate_matches_last_staging_version": false,
+          "candidate_matches_last_staging_version": true,
           "decision": "intentional",
           "deployed_matches_staging_baseline": true,
           "qa": [
@@ -1811,8 +1998,8 @@
             "test_entry_release_parity.test_submission_preflight_rejects_explicit_equity_choppy",
             "test_scheduled_eod.test_entry_intent_crosses_cutoff_before_broker_mutation"
           ],
-          "rationale": "Use the deployed inclusive 09:30\u201311:30 and 13:30\u201314:15 IST windows for entry.",
-          "reason": "Use the deployed inclusive 09:30\u201311:30 and 13:30\u201314:15 IST windows for entry.",
+          "rationale": "Use the deployed inclusive 09:30–11:30 and 13:30–14:15 IST windows for entry.",
+          "reason": "Use the deployed inclusive 09:30–11:30 and 13:30–14:15 IST windows for entry.",
           "sha256": {
             "candidate": "d80460586edd61787a1da93cb42f6045df10ef2373445c6373ebcd3efe37d780",
             "deployed": null
@@ -1825,6 +2012,11 @@
               "after_sha256": "24d8f9882da00b0c267254240a3879239467dc83b88ab30fc8fbf9641b2e2e74",
               "before_sha256": null,
               "commit": "811970b25cd5b2c0d3e263b263c5ccefdb7c263f"
+            },
+            {
+              "after_sha256": "d80460586edd61787a1da93cb42f6045df10ef2373445c6373ebcd3efe37d780",
+              "before_sha256": "24d8f9882da00b0c267254240a3879239467dc83b88ab30fc8fbf9641b2e2e74",
+              "commit": "85296d115c87bb02d384cd0da5d859ae123b18ea"
             }
           ]
         },
@@ -2135,7 +2327,13 @@
             "test_preflight.test_latest_quote_price_timestamp_status_and_scope",
             "test_preflight.test_malformed_future_missing_and_stale_bars",
             "test_preflight.test_expiry_policy_and_explicit_expiry_session",
-            "test_preflight.test_pending_entries_and_protective_orders_both_deny"
+            "test_preflight.test_pending_entries_and_protective_orders_both_deny",
+            "test_operator_option_pricing.test_option_chase_uses_verified_ltp_and_caps_one_amendment",
+            "test_operator_option_pricing.test_option_ltp_beyond_cap_cancels_original_without_replacement",
+            "test_operator_option_pricing.test_option_partial_during_chase_quote_cancels_then_closes_only_residual",
+            "test_preflight.test_missing_quote_persists_incident_without_price_actions",
+            "test_preflight.test_stale_target_quote_persists_incident_without_price_actions",
+            "test_preflight.test_malformed_quote_persists_incident_without_price_actions"
           ],
           "rationale": "Use a fresh, successfully verified quote for the requested instrument and fail closed on malformed or unavailable evidence.",
           "reason": "Use a fresh, successfully verified quote for the requested instrument and fail closed on malformed or unavailable evidence.",
@@ -2144,7 +2342,9 @@
             "deployed": "8749baf6c556449a281d9e7cbde338114fb971eb59e7e8648e948f38eabe9a05"
           },
           "sources": [
-            "preflight"
+            "preflight",
+            "quote_outage",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -3011,7 +3211,10 @@
             "test_entry_protection.test_restart_after_atomic_active_trade_publication",
             "test_entry_protection.test_monitor_rejection_retains_price_then_retries_confirmed_amendment_once",
             "test_preflight.test_unverified_price_blocks_entry_and_chase",
-            "test_safe_behavior.test_p2_partial_fill_sizes_sl_and_journal_to_filled_qty"
+            "test_safe_behavior.test_p2_partial_fill_sizes_sl_and_journal_to_filled_qty",
+            "test_operator_option_pricing.test_option_chase_uses_verified_ltp_and_caps_one_amendment",
+            "test_operator_option_pricing.test_option_ltp_beyond_cap_cancels_original_without_replacement",
+            "test_operator_option_pricing.test_option_partial_during_chase_quote_cancels_then_closes_only_residual"
           ],
           "rationale": "Replace legacy entry and protection flows with durable intents, preserve cutoff, confirm protection and amendment evidence.",
           "reason": "Named QA covers the indicated path. Exact regression coverage for the whole live-to-candidate scope has not been established.",
@@ -3022,7 +3225,8 @@
           "sources": [
             "entry",
             "preflight",
-            "harness"
+            "harness",
+            "operator_regressions"
           ],
           "staging_history": [
             {
@@ -3135,6 +3339,7 @@
         "_tick_with_state": {
           "approved_subdeltas": [
             {
+              "commit": "85296d115c87bb02d384cd0da5d859ae123b18ea",
               "from_sha256": "07cbaf3a55fab5cd0fa6372499380489241676e7892405b5bd725e50568ac2a3",
               "qa": [
                 "test_entry_release_parity.test_live_tick_routes_only_in_window_trending_equity_to_entry",
@@ -3150,22 +3355,22 @@
                 "             print(\"Dry tick observed an active trade.\")\n",
                 "         return\n",
                 " \n",
-                "-    # 5. SCAN FOR NEW ENTRY (Only between 09:20 and 14:15 IST \u2014 no late entries in final 55 mins, max 4 trades/day)\n",
+                "-    # 5. SCAN FOR NEW ENTRY (Only between 09:20 and 14:15 IST — no late entries in final 55 mins, max 4 trades/day)\n",
                 "+    # 5. SCAN FOR NEW ENTRY (entry windows and max 4 trades/day)\n",
                 "     if state.get(\"daily_halted\"):\n",
                 "         if not quiet_scan:\n",
-                "             print(f\"\u23f8\ufe0f Daily halt active: {state.get('daily_halt_reason')}\")\n",
+                "             print(f\"⏸️ Daily halt active: {state.get('daily_halt_reason')}\")\n",
                 "@@ -167,11 +167,11 @@\n",
                 "         if not quiet_scan:\n",
-                "             print(f\"\u26d4 Entries blocked: {state.get('entries_blocked_reason')}\")\n",
+                "             print(f\"⛔ Entries blocked: {state.get('entries_blocked_reason')}\")\n",
                 "         return\n",
                 "-    if not (\"09:20\" <= hhmm <= \"14:15\"):\n",
                 "+    if not _entry_window_open(hhmm):\n",
                 "         if live:\n",
                 "             save_state(state)\n",
                 "         if not quiet_scan:\n",
-                "-            print(f\"\u23f3 Outside active entry window ({hhmm} IST \u2014 cutoff 14:15 IST). Equity: \u20b9{net_liq:,.2f} | Tier: {tier['tier']}\")\n",
-                "+            print(f\"\u23f3 Outside active entry window ({hhmm} IST \u2014 allowed 09:30\u201311:30 and 13:30\u201314:15 IST). Equity: \u20b9{net_liq:,.2f} | Tier: {tier['tier']}\")\n",
+                "-            print(f\"⏳ Outside active entry window ({hhmm} IST — cutoff 14:15 IST). Equity: ₹{net_liq:,.2f} | Tier: {tier['tier']}\")\n",
+                "+            print(f\"⏳ Outside active entry window ({hhmm} IST — allowed 09:30–11:30 and 13:30–14:15 IST). Equity: ₹{net_liq:,.2f} | Tier: {tier['tier']}\")\n",
                 "         return\n",
                 "     if state.get(\"daily_trades_count\", 0) >= 4:\n",
                 "         if live:\n",
@@ -3177,22 +3382,55 @@
                 "             \"direction\": eq_cand[\"direction\"],\n",
                 "             \"quantity\": qty,\n",
                 "             \"tick_size\": eq_tick,\n"
-              ]
+              ],
+              "to_sha256": "d1b656e305cd23999ac0c75c8ff12dda995f08807c5aeca85fd3a4f16a2fbb30"
+            },
+            {
+              "commit": "6fabddd8dda31e8363ee4548c9d6a7fa9b3cd175",
+              "from_sha256": "d1b656e305cd23999ac0c75c8ff12dda995f08807c5aeca85fd3a4f16a2fbb30",
+              "qa": [
+                "test_preflight.test_pending_quote_incident_blocks_entry_after_position_closes"
+              ],
+              "reason": "Fence new entries while a persisted incident remains unresolved after position closure.",
+              "source": "quote_outage",
+              "staging_to_candidate_diff": [
+                "--- 85296d115c87bb02d384cd0da5d859ae123b18ea\n",
+                "+++ 6fabddd8dda31e8363ee4548c9d6a7fa9b3cd175\n",
+                "@@ -159,6 +159,12 @@\n",
+                "         return\n",
+                " \n",
+                "     # 5. SCAN FOR NEW ENTRY (entry windows and max 4 trades/day)\n",
+                "+    if live and (outage := state.get(\"quote_outage\")):\n",
+                "+        if _get_latest_tick_ltp(client, outage[\"security_id\"], outage[\"exchange_segment\"],\n",
+                "+                                outage[\"instrument_type\"]) is None:\n",
+                "+            _alert_quote_outage(outage)\n",
+                "+            return 1\n",
+                "+        _clear_quote_outage(state)\n",
+                "     if state.get(\"daily_halted\"):\n",
+                "         if not quiet_scan:\n",
+                "             print(f\"⏸️ Daily halt active: {state.get('daily_halt_reason')}\")\n"
+              ],
+              "to_sha256": "fe3fffb2fb510670fb210dcac9f785af278156c5bbba39aaf6be819d40bba017"
             }
           ],
-          "candidate_matches_last_staging_version": false,
+          "candidate_matches_last_staging_version": true,
           "decision": "unreviewed",
           "deployed_matches_staging_baseline": true,
           "qa": [
             "test_scheduled_eod.test_entry_intent_crosses_cutoff_before_broker_mutation",
             "test_entry_release_parity.test_live_tick_routes_only_in_window_trending_equity_to_entry",
             "test_preflight.test_pending_entries_and_protective_orders_both_deny",
-            "test_emergency_recovery.test_incident_publication_failure_prevents_broker_mutation"
+            "test_emergency_recovery.test_incident_publication_failure_prevents_broker_mutation",
+            "test_role_permissions.test_status_at_floor",
+            "test_role_permissions.test_dry_tick_at_floor",
+            "test_role_permissions.test_live_tick_at_floor",
+            "test_role_permissions.test_live_switch_alone_at_floor",
+            "test_preflight.test_pending_quote_incident_blocks_entry_after_position_closes"
           ],
           "rationale": "Split the tick lifecycle under role and state ownership, verified exits and fail-closed entries.",
-          "reason": "Operator port is pinned separately. Tick lifecycle changes also affect state, risk, preflight, recovery and exit routing. A single approved entry branch does not cover the full function.",
+          "reason": "The window and regime port and quote-incident entry fence have separate evidence. Full tick integration across state, risk, recovery and exit routing remains unreviewed.",
           "sha256": {
-            "candidate": "d1b656e305cd23999ac0c75c8ff12dda995f08807c5aeca85fd3a4f16a2fbb30",
+            "candidate": "fe3fffb2fb510670fb210dcac9f785af278156c5bbba39aaf6be819d40bba017",
             "deployed": null
           },
           "sources": [
@@ -3200,7 +3438,9 @@
             "eod",
             "guard",
             "preflight",
-            "recovery"
+            "recovery",
+            "operator",
+            "quote_outage"
           ],
           "staging_history": [
             {
@@ -3212,6 +3452,16 @@
               "after_sha256": "07cbaf3a55fab5cd0fa6372499380489241676e7892405b5bd725e50568ac2a3",
               "before_sha256": "fc523db5fd1a2988eb28fd09aa3f8c92ee9ffc83fe065dc1ce75f91e320fb6c1",
               "commit": "7ae4713c7c9375a0bc04ed7463248b2441487679"
+            },
+            {
+              "after_sha256": "d1b656e305cd23999ac0c75c8ff12dda995f08807c5aeca85fd3a4f16a2fbb30",
+              "before_sha256": "07cbaf3a55fab5cd0fa6372499380489241676e7892405b5bd725e50568ac2a3",
+              "commit": "85296d115c87bb02d384cd0da5d859ae123b18ea"
+            },
+            {
+              "after_sha256": "fe3fffb2fb510670fb210dcac9f785af278156c5bbba39aaf6be819d40bba017",
+              "before_sha256": "d1b656e305cd23999ac0c75c8ff12dda995f08807c5aeca85fd3a4f16a2fbb30",
+              "commit": "6fabddd8dda31e8363ee4548c9d6a7fa9b3cd175"
             }
           ]
         },
@@ -3509,16 +3759,18 @@
             "test_write_safety.test_cached_absent",
             "test_write_safety.test_authorized_reconnect",
             "test_write_safety.test_authorized_premarket_repairs_with_mocks",
-            "test_role_permissions.test_status_missing_or_expired_cache"
+            "test_role_permissions.test_status_missing_or_expired_cache",
+            "test_role_permissions.test_status_at_floor"
           ],
           "rationale": "Carry policy across client construction, cache reconnect, SDK connection and IP checks.",
-          "reason": "Named QA covers the indicated path. Exact regression coverage for the whole live-to-candidate scope has not been established.",
+          "reason": "Status at the death floor is covered as read-only. No test directly asserts the new status incident display or the full diagnostic path.",
           "sha256": {
-            "candidate": "9da68e32f8b86a316fddbfdcebb65f60c47cc5b13313f55873d4dc91038f9a33",
+            "candidate": "41cf23e9bb0d9205d2fc39305d7b60f7d690a7bb3b205f429d825d73f9a557c3",
             "deployed": "1887f166c05511071eea71542681c98b71b6133843a9995baa1d435dfb7c714e"
           },
           "sources": [
-            "guard"
+            "guard",
+            "quote_outage"
           ],
           "staging_history": [
             {
@@ -3540,6 +3792,11 @@
               "after_sha256": "9da68e32f8b86a316fddbfdcebb65f60c47cc5b13313f55873d4dc91038f9a33",
               "before_sha256": "3896f32f8b8eac44b1ce27e8ec55bc43ded6cca8a1dd6f727f503e216a0e0639",
               "commit": "7ae4713c7c9375a0bc04ed7463248b2441487679"
+            },
+            {
+              "after_sha256": "41cf23e9bb0d9205d2fc39305d7b60f7d690a7bb3b205f429d825d73f9a557c3",
+              "before_sha256": "9da68e32f8b86a316fddbfdcebb65f60c47cc5b13313f55873d4dc91038f9a33",
+              "commit": "6fabddd8dda31e8363ee4548c9d6a7fa9b3cd175"
             }
           ]
         },
@@ -3660,6 +3917,57 @@
           ]
         },
         "monitor_active_trade_loop": {
+          "approved_subdeltas": [
+            {
+              "commit": "6fabddd8dda31e8363ee4548c9d6a7fa9b3cd175",
+              "from_sha256": "775afc2f3c2d6536032307e22070c850634cd71245813f520de6008ecbf44655",
+              "qa": [
+                "test_preflight.test_monitor_holds_verified_stop_during_quote_outage_and_dispatches_eod",
+                "test_preflight.test_missing_quote_persists_incident_without_price_actions",
+                "test_preflight.test_stale_target_quote_persists_incident_without_price_actions",
+                "test_preflight.test_malformed_quote_persists_incident_without_price_actions",
+                "test_preflight.test_pending_quote_incident_survives_restart_until_validated_quote"
+              ],
+              "reason": "Persist and alert on unavailable broker quotes while continuing position and stop checks; clear on a fresh matching quote.",
+              "source": "quote_outage",
+              "staging_to_candidate_diff": [
+                "--- 85296d115c87bb02d384cd0da5d859ae123b18ea\n",
+                "+++ 6fabddd8dda31e8363ee4548c9d6a7fa9b3cd175\n",
+                "@@ -8,6 +8,7 @@\n",
+                "     - Fires immediate MARKET exit if Stop-Loss, Target, or 25m Theta Kill is hit.\n",
+                "     \"\"\"\n",
+                "     start_ts = time.time()\n",
+                "+    outage_alerted = False\n",
+                "     while time.time() - start_ts < max_seconds:\n",
+                "         active = state.get(\"active_trade\")\n",
+                "         if not active:\n",
+                "@@ -66,9 +67,22 @@\n",
+                " \n",
+                "         # Broker position/protection checks above still run during a quote outage.\n",
+                "         curr_ltp = _get_latest_tick_ltp(client, sec_id, exch, inst)\n",
+                "+        outage = state.get(\"quote_outage\")\n",
+                "         if curr_ltp is None:\n",
+                "+            if outage is None:\n",
+                "+                outage = dict(security_id=sec_id, exchange_segment=exch, instrument_type=inst,\n",
+                "+                              started_at=datetime.now(IST).isoformat())\n",
+                "+                updated = state.copy()\n",
+                "+                updated[\"quote_outage\"] = outage\n",
+                "+                _save_state_update(state, updated)\n",
+                "+            if not outage_alerted:\n",
+                "+                _alert_quote_outage(outage)\n",
+                "+                outage_alerted = True\n",
+                "             time.sleep(MONITOR_POLL_S)\n",
+                "             continue\n",
+                "+        if outage and (outage[\"security_id\"], outage[\"exchange_segment\"]) == (sec_id, exch):\n",
+                "+            _clear_quote_outage(state)\n",
+                "+            outage_alerted = False\n",
+                " \n",
+                "         try:\n",
+                "             entry_dt = datetime.fromisoformat(active[\"entry_time\"])\n"
+              ],
+              "to_sha256": "227d62770501b6af976c07b7aca34d41c86c36d59a82c2c0ba662ce8e253c8d4"
+            }
+          ],
           "candidate_matches_last_staging_version": true,
           "decision": "unreviewed",
           "deployed_matches_staging_baseline": true,
@@ -3669,18 +3977,24 @@
             "test_entry_protection.test_restart_after_atomic_active_trade_publication",
             "test_entry_protection.test_monitor_rejection_retains_price_then_retries_confirmed_amendment_once",
             "test_preflight.test_unverified_price_blocks_entry_and_chase",
-            "test_safe_behavior.test_p2_partial_fill_sizes_sl_and_journal_to_filled_qty"
+            "test_safe_behavior.test_p2_partial_fill_sizes_sl_and_journal_to_filled_qty",
+            "test_preflight.test_monitor_holds_verified_stop_during_quote_outage_and_dispatches_eod",
+            "test_preflight.test_missing_quote_persists_incident_without_price_actions",
+            "test_preflight.test_stale_target_quote_persists_incident_without_price_actions",
+            "test_preflight.test_malformed_quote_persists_incident_without_price_actions",
+            "test_preflight.test_pending_quote_incident_survives_restart_until_validated_quote"
           ],
           "rationale": "Replace legacy entry and protection flows with durable intents, preserve cutoff, confirm protection and amendment evidence.",
-          "reason": "Named QA covers the indicated path. Exact regression coverage for the whole live-to-candidate scope has not been established.",
+          "reason": "Incident persistence, restart recovery, broker stop checks, EOD and no candle fallback have focused coverage. Older live-to-staging stop and exit orchestration still needs whole-scope adjudication.",
           "sha256": {
-            "candidate": "775afc2f3c2d6536032307e22070c850634cd71245813f520de6008ecbf44655",
+            "candidate": "227d62770501b6af976c07b7aca34d41c86c36d59a82c2c0ba662ce8e253c8d4",
             "deployed": "73032430efe22286f678ac60f608aa8ecd812f080f1c050617952a366b6865f4"
           },
           "sources": [
             "entry",
             "preflight",
-            "harness"
+            "harness",
+            "quote_outage"
           ],
           "staging_history": [
             {
@@ -3712,6 +4026,11 @@
               "after_sha256": "775afc2f3c2d6536032307e22070c850634cd71245813f520de6008ecbf44655",
               "before_sha256": "fd58731f8cd192b3fc8fa49941bf908831e8365eda7a231269e9f8ba2fd2cc53",
               "commit": "7ae4713c7c9375a0bc04ed7463248b2441487679"
+            },
+            {
+              "after_sha256": "227d62770501b6af976c07b7aca34d41c86c36d59a82c2c0ba662ce8e253c8d4",
+              "before_sha256": "775afc2f3c2d6536032307e22070c850634cd71245813f520de6008ecbf44655",
+              "commit": "6fabddd8dda31e8363ee4548c9d6a7fa9b3cd175"
             }
           ]
         },
@@ -3787,6 +4106,7 @@
         "scan_equity_candidates": {
           "approved_subdeltas": [
             {
+              "commit": "85296d115c87bb02d384cd0da5d859ae123b18ea",
               "from_sha256": "0b97f893778e2b29bc09e5a338c67695cebe9826c86a3df22ec22c19fbf89df6",
               "qa": [
                 "test_entry_release_parity.test_live_tick_routes_only_in_window_trending_equity_to_entry",
@@ -3825,10 +4145,11 @@
                 "                     \"direction\": \"SHORT\",\n",
                 "                     \"ltp\": round(close, 2),\n",
                 "                     \"atr\": round(atr, 2),\n"
-              ]
+              ],
+              "to_sha256": "2b1317a125c5e2f68224428b9decf2c7707cb64a7340cab1f41e578dec624b90"
             }
           ],
-          "candidate_matches_last_staging_version": false,
+          "candidate_matches_last_staging_version": true,
           "decision": "unreviewed",
           "deployed_matches_staging_baseline": false,
           "qa": [
@@ -3844,7 +4165,8 @@
             "deployed": "f65993fb75335ceef9f1755cd21bd3cc0a69cf35973532acf7b99ac5192e77b6"
           },
           "sources": [
-            "preflight"
+            "preflight",
+            "operator"
           ],
           "staging_history": [
             {
@@ -3856,6 +4178,11 @@
               "after_sha256": "0b97f893778e2b29bc09e5a338c67695cebe9826c86a3df22ec22c19fbf89df6",
               "before_sha256": "d5e71d309968c115ba4a0d9a0d18fd526691793e6b85292f59bb2b417a849b52",
               "commit": "7ae4713c7c9375a0bc04ed7463248b2441487679"
+            },
+            {
+              "after_sha256": "2b1317a125c5e2f68224428b9decf2c7707cb64a7340cab1f41e578dec624b90",
+              "before_sha256": "0b97f893778e2b29bc09e5a338c67695cebe9826c86a3df22ec22c19fbf89df6",
+              "commit": "85296d115c87bb02d384cd0da5d859ae123b18ea"
             }
           ]
         },
@@ -3916,7 +4243,11 @@
             "test_emergency_recovery.test_incident_publication_failure_prevents_broker_mutation",
             "test_emergency_recovery.test_corrupt_bytes_are_preserved_and_manual_restart_uses_broker",
             "test_emergency_recovery.test_crash_after_journal_rechecks_broker_before_applying_risk",
-            "test_exit_fence_permutations.test_verified_recovery_in_both_directions_and_orders"
+            "test_exit_fence_permutations.test_verified_recovery_in_both_directions_and_orders",
+            "test_role_permissions.test_status_at_floor",
+            "test_role_permissions.test_dry_tick_at_floor",
+            "test_role_permissions.test_live_tick_at_floor",
+            "test_role_permissions.test_live_switch_alone_at_floor"
           ],
           "rationale": "Persist the emergency incident before liquidation and preserve pending or disputed state until broker verification.",
           "reason": "Named QA covers the indicated path. Exact regression coverage for the whole live-to-candidate scope has not been established.",
@@ -3926,7 +4257,8 @@
           },
           "sources": [
             "recovery",
-            "exits"
+            "exits",
+            "guard"
           ],
           "staging_history": [
             {
@@ -3985,12 +4317,30 @@
         }
       },
       "source_sha256": {
-        "candidate": "ca690f8d14b2fa50140342fdd6dd8362a78ce1aab21124f41b0d2fbb51da63b2",
+        "candidate": "39994a2fce912731005a586c9ed32d07d8308c44c05c43e3fbadfc719fe71339",
         "deployed": "60cb6bb1203de2fc7f141513307e4a62cceb1a4f2d8a0c807d9e8b6be47c9b80"
       }
     }
   },
   "qa": {
+    "test_cloud_probe_cli.test_broker_cli_reads_using_cache_only_under_live_switch": {
+      "assertion": "Standalone broker probe opts into cache-only reads under the live switch and performs no renewal or token writes.",
+      "path": "tests/test_cloud_probe_cli.py",
+      "sha256": "1cc1951891bf0ea863cbe2319cb3c01d5812c9ed8cedd682ccb9c913842508ed",
+      "test": "test_broker_cli_reads_using_cache_only_under_live_switch"
+    },
+    "test_cloud_probe_cli.test_broker_cli_without_cache_stops_before_sdk_and_dhan_http": {
+      "assertion": "Cache miss in standalone broker mode denies before SDK construction or Dhan HTTP.",
+      "path": "tests/test_cloud_probe_cli.py",
+      "sha256": "1cc1951891bf0ea863cbe2319cb3c01d5812c9ed8cedd682ccb9c913842508ed",
+      "test": "test_broker_cli_without_cache_stops_before_sdk_and_dhan_http"
+    },
+    "test_cloud_probe_cli.test_default_cli_only_reads_public_ip": {
+      "assertion": "Default standalone CLI makes one mocked public IP GET without constructing a broker client.",
+      "path": "tests/test_cloud_probe_cli.py",
+      "sha256": "1cc1951891bf0ea863cbe2319cb3c01d5812c9ed8cedd682ccb9c913842508ed",
+      "test": "test_default_cli_only_reads_public_ip"
+    },
     "test_emergency_recovery.test_corrupt_bytes_are_preserved_and_manual_restart_uses_broker": {
       "assertion": "Corrupt original and quarantine copy stay byte-identical and restart does not duplicate liquidation.",
       "path": "tests/test_emergency_recovery.py",
@@ -4099,34 +4449,124 @@
       "sha256": "ff857b7ffd16e77baa401138a0b0895dbf42c033d7424438c41c6b4d1a87a2a1",
       "test": "test_live_flag_passes_writes"
     },
+    "test_operator_guard_client.test_authorized_flatten_waits_for_orders_and_position_to_agree": {
+      "assertion": "Contradictory order and position proof fences flatten; converged proof allows one 65-unit sell, with no duplicate on replay.",
+      "path": "tests/test_operator_guard_client.py",
+      "sha256": "1b328f497f3072d5caadea70d543ebfa51cd107716958bacd9792660ff8355ad",
+      "test": "test_authorized_flatten_waits_for_orders_and_position_to_agree"
+    },
+    "test_operator_guard_client.test_env_loader_precedence_and_return_value": {
+      "assertion": "Loader returns parsed values including excluded keys, updates ordinary environment values, and returns an empty mapping for a missing file. Process live switch takes precedence over file fallback.",
+      "path": "tests/test_operator_guard_client.py",
+      "sha256": "1b328f497f3072d5caadea70d543ebfa51cd107716958bacd9792660ff8355ad",
+      "test": "test_env_loader_precedence_and_return_value"
+    },
+    "test_operator_guard_client.test_failed_atomic_replacement_preserves_current_token_and_retries": {
+      "assertion": "Replacement failure cleans temporary and lock paths and preserves in-memory token and expiry; forced retry writes the replacement.",
+      "path": "tests/test_operator_guard_client.py",
+      "sha256": "1b328f497f3072d5caadea70d543ebfa51cd107716958bacd9792660ff8355ad",
+      "test": "test_failed_atomic_replacement_preserves_current_token_and_retries"
+    },
+    "test_operator_guard_client.test_read_only_exit_method_is_denied_even_with_live_switch": {
+      "assertion": "Explicit READ_ONLY denies direct exit submission even with the process live switch enabled.",
+      "path": "tests/test_operator_guard_client.py",
+      "sha256": "1b328f497f3072d5caadea70d543ebfa51cd107716958bacd9792660ff8355ad",
+      "test": "test_read_only_exit_method_is_denied_even_with_live_switch"
+    },
+    "test_operator_guard_client.test_read_only_uses_near_expiry_cache_and_denies_at_expiry": {
+      "assertion": "Read-only manager serves near-expiry cache and denies at expiry without lock, replacement or renewal.",
+      "path": "tests/test_operator_guard_client.py",
+      "sha256": "1b328f497f3072d5caadea70d543ebfa51cd107716958bacd9792660ff8355ad",
+      "test": "test_read_only_uses_near_expiry_cache_and_denies_at_expiry"
+    },
+    "test_operator_guard_client.test_refresh_failure_cleans_lock_and_can_retry": {
+      "assertion": "Renewal-capable manager rejects five-minute cache, unlocks after a mocked timeout and retries successfully.",
+      "path": "tests/test_operator_guard_client.py",
+      "sha256": "1b328f497f3072d5caadea70d543ebfa51cd107716958bacd9792660ff8355ad",
+      "test": "test_refresh_failure_cleans_lock_and_can_retry"
+    },
+    "test_operator_option_pricing.test_option_chase_uses_verified_ltp_and_caps_one_amendment": {
+      "assertion": "Verified broker LTP drives the opening limit and a single amendment at the exact cap, followed by a stop sized to the verified fill.",
+      "path": "tests/test_operator_option_pricing.py",
+      "sha256": "d0070b4980420d0fb84c2417dd0eb8df40dcafedcf33ad46070633053f941aa0",
+      "test": "test_option_chase_uses_verified_ltp_and_caps_one_amendment"
+    },
+    "test_operator_option_pricing.test_option_ltp_beyond_cap_cancels_original_without_replacement": {
+      "assertion": "Quote beyond the cap cancels the original buy without amendments, replacement or exposure.",
+      "path": "tests/test_operator_option_pricing.py",
+      "sha256": "d0070b4980420d0fb84c2417dd0eb8df40dcafedcf33ad46070633053f941aa0",
+      "test": "test_option_ltp_beyond_cap_cancels_original_without_replacement"
+    },
+    "test_operator_option_pricing.test_option_partial_during_chase_quote_cancels_then_closes_only_residual": {
+      "assertion": "A fill appearing during quote retrieval prevents amendment; cancellation precedes one market sell sized to residual exposure.",
+      "path": "tests/test_operator_option_pricing.py",
+      "sha256": "d0070b4980420d0fb84c2417dd0eb8df40dcafedcf33ad46070633053f941aa0",
+      "test": "test_option_partial_during_chase_quote_cancels_then_closes_only_residual"
+    },
     "test_preflight.test_expiry_policy_and_explicit_expiry_session": {
       "assertion": "Expiry must match the calendar and explicit supported session rules.",
       "path": "tests/test_preflight.py",
-      "sha256": "38f640b8c44159dae318935efd09c75dd61a8accc733b3327c3d2c8bc3c974d9",
+      "sha256": "dd07b57ad0521e8b4122923d8347b57c93e70dd9cbfad531e891d663883fdd39",
       "test": "test_expiry_policy_and_explicit_expiry_session"
     },
     "test_preflight.test_latest_quote_price_timestamp_status_and_scope": {
       "assertion": "Quote lookup accepts a matching fresh quote and rejects bad amounts, timestamps, response status and instrument identity.",
       "path": "tests/test_preflight.py",
-      "sha256": "38f640b8c44159dae318935efd09c75dd61a8accc733b3327c3d2c8bc3c974d9",
+      "sha256": "dd07b57ad0521e8b4122923d8347b57c93e70dd9cbfad531e891d663883fdd39",
       "test": "test_latest_quote_price_timestamp_status_and_scope"
     },
     "test_preflight.test_malformed_future_missing_and_stale_bars": {
       "assertion": "Malformed, stale, future and missing bars fail readiness.",
       "path": "tests/test_preflight.py",
-      "sha256": "38f640b8c44159dae318935efd09c75dd61a8accc733b3327c3d2c8bc3c974d9",
+      "sha256": "dd07b57ad0521e8b4122923d8347b57c93e70dd9cbfad531e891d663883fdd39",
       "test": "test_malformed_future_missing_and_stale_bars"
+    },
+    "test_preflight.test_malformed_quote_persists_incident_without_price_actions": {
+      "assertion": "Non-finite quote persists incident without price actions or candle fallback.",
+      "path": "tests/test_preflight.py",
+      "sha256": "dd07b57ad0521e8b4122923d8347b57c93e70dd9cbfad531e891d663883fdd39",
+      "test": "test_malformed_quote_persists_incident_without_price_actions"
+    },
+    "test_preflight.test_missing_quote_persists_incident_without_price_actions": {
+      "assertion": "Missing quote persists incident and alerts while broker position and stop checks continue; no candle read, amendment or flatten.",
+      "path": "tests/test_preflight.py",
+      "sha256": "dd07b57ad0521e8b4122923d8347b57c93e70dd9cbfad531e891d663883fdd39",
+      "test": "test_missing_quote_persists_incident_without_price_actions"
+    },
+    "test_preflight.test_monitor_holds_verified_stop_during_quote_outage_and_dispatches_eod": {
+      "assertion": "Stale quote leaves verified stop unchanged and the scheduled EOD route dispatches independently.",
+      "path": "tests/test_preflight.py",
+      "sha256": "dd07b57ad0521e8b4122923d8347b57c93e70dd9cbfad531e891d663883fdd39",
+      "test": "test_monitor_holds_verified_stop_during_quote_outage_and_dispatches_eod"
     },
     "test_preflight.test_pending_entries_and_protective_orders_both_deny": {
       "assertion": "Both pending entry and protective orders cause nonzero readiness.",
       "path": "tests/test_preflight.py",
-      "sha256": "38f640b8c44159dae318935efd09c75dd61a8accc733b3327c3d2c8bc3c974d9",
+      "sha256": "dd07b57ad0521e8b4122923d8347b57c93e70dd9cbfad531e891d663883fdd39",
       "test": "test_pending_entries_and_protective_orders_both_deny"
+    },
+    "test_preflight.test_pending_quote_incident_blocks_entry_after_position_closes": {
+      "assertion": "Pending incident survives position closure and blocks the entry scan until a validated quote clears it.",
+      "path": "tests/test_preflight.py",
+      "sha256": "dd07b57ad0521e8b4122923d8347b57c93e70dd9cbfad531e891d663883fdd39",
+      "test": "test_pending_quote_incident_blocks_entry_after_position_closes"
+    },
+    "test_preflight.test_pending_quote_incident_survives_restart_until_validated_quote": {
+      "assertion": "Persisted incident survives restart and stale quote, then clears on a validated quote and permits target exit.",
+      "path": "tests/test_preflight.py",
+      "sha256": "dd07b57ad0521e8b4122923d8347b57c93e70dd9cbfad531e891d663883fdd39",
+      "test": "test_pending_quote_incident_survives_restart_until_validated_quote"
+    },
+    "test_preflight.test_stale_target_quote_persists_incident_without_price_actions": {
+      "assertion": "Stale target-crossing quote persists incident without price actions or candle fallback.",
+      "path": "tests/test_preflight.py",
+      "sha256": "dd07b57ad0521e8b4122923d8347b57c93e70dd9cbfad531e891d663883fdd39",
+      "test": "test_stale_target_quote_persists_incident_without_price_actions"
     },
     "test_preflight.test_unverified_price_blocks_entry_and_chase": {
       "assertion": "Bad quote evidence blocks entry and chase.",
       "path": "tests/test_preflight.py",
-      "sha256": "38f640b8c44159dae318935efd09c75dd61a8accc733b3327c3d2c8bc3c974d9",
+      "sha256": "dd07b57ad0521e8b4122923d8347b57c93e70dd9cbfad531e891d663883fdd39",
       "test": "test_unverified_price_blocks_entry_and_chase"
     },
     "test_reconcile.test_actual_fee_contradiction_fences_replay": {
@@ -4152,6 +4592,30 @@
       "path": "tests/test_reconcile.py",
       "sha256": "7c0d81d60472de6b8f327b7b08460c13c50ca0f03c29a1433b48a6fbed05d5c0",
       "test": "test_net_after_fees_and_late_actual_charges_by_exit_route"
+    },
+    "test_role_permissions.test_dry_tick_at_floor": {
+      "assertion": "Dry tick at the death floor does not commit mortality.",
+      "path": "tests/test_role_permissions.py",
+      "sha256": "3645b8fdb65e9b074234b74522bf289858806a22efd7c6f4f04ee99c2794caa8",
+      "test": "test_dry_tick_at_floor"
+    },
+    "test_role_permissions.test_live_switch_alone_at_floor": {
+      "assertion": "Live tick requested with activation switch off does not commit mortality.",
+      "path": "tests/test_role_permissions.py",
+      "sha256": "3645b8fdb65e9b074234b74522bf289858806a22efd7c6f4f04ee99c2794caa8",
+      "test": "test_live_switch_alone_at_floor"
+    },
+    "test_role_permissions.test_live_tick_at_floor": {
+      "assertion": "Authorized live tick with mocked below-floor equity cancels the working buy and records DEAD_COMA and an obituary.",
+      "path": "tests/test_role_permissions.py",
+      "sha256": "3645b8fdb65e9b074234b74522bf289858806a22efd7c6f4f04ee99c2794caa8",
+      "test": "test_live_tick_at_floor"
+    },
+    "test_role_permissions.test_status_at_floor": {
+      "assertion": "Status at the death floor performs no engine lock, state save, obituary or broker writes.",
+      "path": "tests/test_role_permissions.py",
+      "sha256": "3645b8fdb65e9b074234b74522bf289858806a22efd7c6f4f04ee99c2794caa8",
+      "test": "test_status_at_floor"
     },
     "test_role_permissions.test_status_missing_or_expired_cache": {
       "assertion": "Missing or expired tokens cannot construct the SDK, renew, or send PUT even when the enable switch is set.",
@@ -4255,13 +4719,23 @@
     },
     "operator": {
       "card": "t_c53a542c",
-      "evidence": "Operator approved the two deployed entry windows and the equity CHOPPY filter. The current diff ports the approval into candidate scan and preflight.",
-      "gate_commit": null
+      "evidence": "Operator approved the deployed IST entry windows and equity CHOPPY filter. 85296d1 ports the approval into candidate scan and preflight.",
+      "gate_commit": "85296d115c87bb02d384cd0da5d859ae123b18ea"
+    },
+    "operator_regressions": {
+      "card": "t_c53a542c",
+      "evidence": "6c22302 stages mocked guard, probe and option regressions and fixes token publication, the exact chase cap and post-quote broker revalidation. See release/operator-regressions.md and release/README.md.",
+      "gate_commit": "6c223027251f5d1296c9e43c515384d3c4254607"
     },
     "preflight": {
       "card": "t_104d48d1",
       "evidence": "preflight-7ae4713-gate.txt records 364 isolated tests. Candidate checks calendar, bars, expiry, quote and pending order evidence.",
       "gate_commit": "7ae4713c7c9375a0bc04ed7463248b2441487679"
+    },
+    "quote_outage": {
+      "card": "t_c53a542c",
+      "evidence": "6fabddd records the durable quote incident and adds mocked outage, restart and entry-fence cases in tests/test_preflight.py.",
+      "gate_commit": "6fabddd8dda31e8363ee4548c9d6a7fa9b3cd175"
     },
     "reconcile": {
       "card": "t_e10e495e",
