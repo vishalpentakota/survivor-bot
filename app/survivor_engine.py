@@ -23,10 +23,11 @@ import json
 import time
 import math
 import errno
+import fcntl
 import socket
 import argparse
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
 
@@ -40,12 +41,14 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cloud_guard import LIVE_SWITCH, READ_ONLY, ReadOnlyBroker, RolePolicy, live_trading_enabled
 from dhan_broker import CachedTokenUnavailable, DhanTokenManager, load_env_file
+from eod_ownership import (
+    EodStore, IST, LOCK_POLL_SECONDS, WINDOW_SECONDS, owner_record, publish_owner, scheduled_slot,
+)
 from verified_exit import (
     ExitCoordinator, FlattenResult, TERMINAL, execution_evidence, fill as order_fill, instrument,
     integer as broker_integer, locked as exit_lock, order_detail, persist as persist_exit_data, positions as verified_positions, same_execution,
 )
 
-IST = timezone(timedelta(hours=5, minutes=30))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EXIT_LEDGER = os.path.join(BASE_DIR, "survivor_exits.json")
 STATE_FILE = os.path.join(BASE_DIR, "survivor_state.json")
@@ -209,9 +212,14 @@ def send_telegram(message: str) -> bool:
     return False
 
 
-def _exit_coordinator(client):
+def _entry_window_open():
+    return "09:20" <= datetime.now(IST).strftime("%H:%M") <= "14:15"
+
+
+def _exit_coordinator(client, *, budget=None):
     return ExitCoordinator(client.dhan, EXIT_LEDGER, send_telegram, polls=FLATTEN_POLL_N,
-                           interval=FLATTEN_POLL_S, deadline=EXIT_ESCALATION_SECONDS)
+                           interval=FLATTEN_POLL_S, deadline=EXIT_ESCALATION_SECONDS,
+                           entry_allowed=_entry_window_open, budget=budget)
 
 
 def _recovery_pending(client, active=None) -> bool:
@@ -300,98 +308,130 @@ def _get_latest_tick_ltp(client: "SurvivorDhanClient", security_id: str,
         return None
 
 
-def _acquire_owner_lock() -> bool:
-    if os.path.exists(_OWNER_LOCK_FILE):
-        pid = None
-        try:
-            with open(_OWNER_LOCK_FILE) as f:
-                pid = int(f.read().strip())
-        except (ValueError, OSError):
-            pid = None
-        stale = False
-        if pid is None or not _pid_alive(pid):
-            stale = True
-        try:
-            age = time.time() - os.path.getmtime(_OWNER_LOCK_FILE)
-            if age > 120 and (pid is None or not _pid_alive(pid)):
-                stale = True
-        except OSError:
-            pass
-        if pid is not None and _pid_alive(pid) and not stale:
-            logger.warning(f"Another survivor owner (pid {pid}) is already running; refusing to start.")
-            return False
-        try:
-            os.unlink(_OWNER_LOCK_FILE)
-        except OSError:
-            pass
+def _engine_lock_path():
+    return os.path.join(BASE_DIR, ".survivor_engine.lock")
+
+
+def acquire_engine_lock(purpose: str = "routine") -> Optional[int]:
+    """Claim the stable inode for the entire broker transaction."""
+    fd = os.open(_engine_lock_path(), os.O_CREAT | os.O_RDWR, 0o600)
+    owned = False
     try:
-        with open(_OWNER_LOCK_FILE, "w") as f:
-            f.write(str(os.getpid()))
-    except OSError:
-        return False
-    return True
-
-
-def _release_owner_lock() -> None:
-    try:
-        if os.path.exists(_OWNER_LOCK_FILE):
-            with open(_OWNER_LOCK_FILE) as f:
-                if int(f.read().strip()) == os.getpid():
-                    os.unlink(_OWNER_LOCK_FILE)
-    except (OSError, ValueError):
-        pass
-
-
-def acquire_engine_lock() -> Optional[int]:
-    """
-    P5 single-owner engine lock. One tick owns the engine for the whole trading
-    transaction (scan -> entry -> monitor); a concurrent tick is a no-op.
-    A stale lock is broken if the recorded PID is dead OR if the lock is older
-    than 4 minutes (process may be stuck in the monitor loop).
-    """
-    path = os.path.join(BASE_DIR, ".survivor_engine.lock")
-    for _ in range(3):
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, f"{os.getpid()}:{time.time()}".encode())
-            return fd
-        except FileExistsError:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+
+        # Respect a live owner from the previous O_EXCL implementation.
+        legacy = os.pread(fd, 128, 0).decode()
+        if legacy and not legacy.startswith("{"):
             try:
-                with open(path, "r") as f:
-                    content = f.read().strip()
-                if ":" in content:
-                    pid_str, ts_str = content.split(":", 1)
-                    pid = int(pid_str)
-                    lock_ts = float(ts_str)
-                else:
-                    pid = int(content)
-                    lock_ts = 0.0
-                # Break if PID is dead OR lock is older than 4 minutes
-                if (pid and not _pid_alive(pid)) or (time.time() - lock_ts > 240):
-                    os.unlink(path)
-                    continue
-            except (ValueError, OSError):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-                continue
-            return None   # live owner (or unreadable lock): duplicate tick -> skip
-    return None
+                pid = int(legacy.split(":", 1)[0])
+            except ValueError:
+                return None
+            if pid > 0 and _pid_alive(pid):
+                return None
+
+        publish_owner(fd, {"pid": os.getpid(), "purpose": purpose,
+                           "started": datetime.now(IST).timestamp()})
+        owned = True
+        return fd
+    finally:
+        if not owned:
+            os.close(fd)
 
 
 def release_engine_lock(fd: Optional[int]) -> None:
-    if fd is None:
-        return
-    try:
+    if fd is not None:
         os.close(fd)
-    except OSError:
-        pass
-    try:
-        os.unlink(os.path.join(BASE_DIR, ".survivor_engine.lock"))
-    except OSError:
-        pass
 
+
+def _eod_store():
+    return EodStore(os.path.join(BASE_DIR, "survivor_eod.sqlite3"))
+
+
+def _scheduled_flatten(policy: RolePolicy) -> int:
+    now = datetime.now(IST)
+    slot = scheduled_slot(now)
+    if slot is None:
+        print("Scheduled flatten requires an IST dispatch slot.")
+        return 1
+    day = slot.date().isoformat()
+    store = _eod_store()
+    attempt = store.begin(day, slot.strftime("%H:%M"))
+    if attempt is None:
+        print("Scheduled flatten ownership already claimed for this slot.")
+        return 1
+    closing = slot + timedelta(seconds=WINDOW_SECONDS)
+    remaining = (closing - now).total_seconds()
+    deadline = time.monotonic() + remaining
+
+    def budget():
+        return min(deadline - time.monotonic(), (closing - datetime.now(IST)).total_seconds())
+
+    def finish(status, details):
+        message = store.finish(attempt, day, status, details)
+        if message:
+            print(message, flush=True)
+        return int(status != "flat")
+
+    last_owner = {}
+    while budget() > 0:
+        fd = acquire_engine_lock("scheduled")
+        if fd is not None:
+            try:
+                store.interrupted(day, attempt, _pid_alive)
+                if budget() <= 0:
+                    break
+                try:
+                    client = SurvivorDhanClient(policy=policy)
+                    result = _exit_coordinator(client, budget=budget).flatten(3)
+                except Exception as exc:
+                    result = None
+                    details = f"Exposure UNKNOWN ({type(exc).__name__})"
+                if budget() <= 0:
+                    break
+                if result is None:
+                    return finish("unknown", details)
+                if not result.flat:
+                    status = "unknown" if result.unknown else "incomplete"
+                    return finish(status, f"Exposure UNKNOWN. {result[0]}")
+                print(result[0])
+                return finish("flat", "")
+            finally:
+                release_engine_lock(fd)
+
+        last_owner = owner_record(_engine_lock_path())
+        cutoff = slot.replace(hour=15, minute=10).timestamp()
+        if last_owner and (last_owner.get("purpose") != "routine"
+                           or last_owner.get("started", cutoff) >= cutoff):
+            return finish("contention", "Engine ownership held by another invocation; exposure UNKNOWN")
+        delay = min(LOCK_POLL_SECONDS, budget())
+        if delay > 0:
+            time.sleep(delay)
+
+    evidence = last_owner.get("exposure", "UNKNOWN")
+    return finish("deadline_breach", f"Scheduled flatten deadline breached; last verified exposure {json.dumps(evidence)}")
+
+
+def cmd_flatten(policy: RolePolicy, *, scheduled: bool = False) -> int:
+    if scheduled:
+        return _scheduled_flatten(policy)
+    fd = acquire_engine_lock()
+    if fd is None:
+        print("Emergency flatten unavailable: engine ownership held by another invocation.")
+        return 1
+    try:
+        try:
+            client = SurvivorDhanClient(policy=policy)
+        except CachedTokenUnavailable as exc:
+            print(f"Emergency flatten unavailable: {exc}")
+            return 1
+        result = client.emergency_flatten_all()
+        print("Emergency Flatten:", result)
+        return int(not result.flat)
+    finally:
+        release_engine_lock(fd)
 
 
 def load_state(*, read_only: bool = False) -> Dict:
@@ -2067,15 +2107,28 @@ def cmd_tick(live: bool = False, quiet_scan: bool = False, *, policy: Optional[R
 
     lock_fd = acquire_engine_lock()
     if lock_fd is None:
-        print("⏭️ [ENGINE LOCK] Another tick owns the engine; duplicate tick skipped.")
-        return
+        print("Tick unavailable: engine ownership held by another invocation.")
+        return 1
     try:
-        return _cmd_tick_inner(policy=policy, quiet_scan=quiet_scan)
+        slot = scheduled_slot(datetime.now(IST))
+        if slot is not None and _eod_store().claimed(slot):
+            print("Tick yielding to scheduled EOD ownership for this slot.")
+            return 1
+        return _cmd_tick_inner(policy=policy, quiet_scan=quiet_scan, owner_fd=lock_fd)
     finally:
         release_engine_lock(lock_fd)
 
 
-def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False) -> Optional[int]:
+def _publish_tick_exposure(fd, positions):
+    exposure = [list(instrument(row)) + [broker_integer(row["netQty"])]
+                for row in positions if broker_integer(row["netQty"])]
+    record = owner_record(_engine_lock_path())
+    if record.get("pid") == os.getpid():
+        record["exposure"] = exposure
+        publish_owner(fd, record)
+
+
+def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False, owner_fd=None) -> Optional[int]:
     """
     Tick body. cmd_tick holds the engine lock for authorized live trading.
     When `quiet_scan=True` (used by `no_agent=True` zero-token cron jobs), routine idle/scan/cooldown
@@ -2114,9 +2167,19 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
         return _flatten_trade(client, state, active, "RESTART_EXIT_RECOVERY")
     if state["status"] == "DEAD_COMA":
         return
-    if live and _safe_get_positions(client) is None:
-        return _flatten_trade(client, state, active, "POSITION_UNVERIFIED")
-    net_liq, avail, utilized, open_pos = client.get_live_equity_and_positions()
+    if live:
+        positions = _safe_get_positions(client)
+        if positions is None:
+            return _flatten_trade(client, state, active, "POSITION_UNVERIFIED")
+        if owner_fd is not None:
+            _publish_tick_exposure(owner_fd, positions)
+
+    try:
+        net_liq, avail, utilized, open_pos = client.get_live_equity_and_positions()
+    except Exception:
+        if live and datetime.now(IST).strftime("%H:%M") >= "15:10":
+            return _flatten_trade(client, state, active, "EOD_SQUARE_OFF")
+        raise
 
     now_ist = datetime.now(IST)
     today_str = now_ist.strftime("%Y-%m-%d")
@@ -2155,6 +2218,9 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
         print(obituary)
         return exit_status
 
+    if live and hhmm >= "15:10":
+        return _flatten_trade(client, state, state.get("active_trade"), "EOD_SQUARE_OFF")
+
     # If still waiting for ₹30,000 top-up and not forced, report standby status cleanly
     if not state["mortality_armed"]:
         if live:
@@ -2192,11 +2258,8 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
             print(f"🛑 Daily survival circuit breaker triggered: {state['daily_halt_reason']}. Resting until tomorrow.")
         return exit_status
 
-    # 3. MANDATORY EOD INTRADAY SQUARE-OFF (3:10 PM IST onwards)
     if hhmm >= "15:10":
-        if live:
-            return _flatten_trade(client, state, state.get("active_trade"), "EOD_SQUARE_OFF")
-        elif not quiet_scan:
+        if not quiet_scan:
             print(f"Dry tick reached the EOD square-off window at {hhmm} IST.")
         return
 
@@ -2700,11 +2763,14 @@ def cmd_premarket(*, policy: Optional[RolePolicy] = None) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dhan Survivor Autonomous Trading Organism")
-    parser.add_argument("action", choices=["status", "premarket", "tick", "reconcile", "flatten", "simulate-coma-test"], help="Action to run")
+    parser.add_argument("action", choices=["status", "premarket", "tick", "reconcile", "flatten", "eod-alerts", "simulate-coma-test"], help="Action to run")
     parser.add_argument("--live", action="store_true", help="Enable the requested live action")
     parser.add_argument("--repair", action="store_true", help="Permit token and IP repair with premarket --live")
     parser.add_argument("--quiet", action="store_true", help="Silent on idle/no-op scans (for zero-token no_agent=True cron jobs)")
+    parser.add_argument("--scheduled", action="store_true", help="Apply scheduled EOD dispatch policy")
     args = parser.parse_args()
+    if args.scheduled and args.action != "flatten":
+        parser.error("--scheduled is only valid for flatten")
     if args.repair and args.action != "premarket":
         parser.error("--repair is only valid for premarket")
     policy = _resolve_role(args.action, live=args.live, repair=args.repair)
@@ -2721,11 +2787,10 @@ if __name__ == "__main__":
     elif args.action == "flatten":
         if not policy.flatten:
             parser.error("flatten requires --live and SURVIVOR_LIVE_TRADING=1")
-        c = SurvivorDhanClient(policy=policy)
-        result = c.emergency_flatten_all()
-        print("Emergency Flatten:", result)
-        if not result.flat:
+        if cmd_flatten(policy, scheduled=args.scheduled):
             sys.exit(1)
+    elif args.action == "eod-alerts":
+        _eod_store().drain(send_telegram)
     elif args.action == "simulate-coma-test":
         # Non-destructive self-test of the coma/obituary logic using a mock state copy
         print("Running non-destructive self-test of Option 2 Permanent Coma logic...")

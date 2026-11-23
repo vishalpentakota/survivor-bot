@@ -1,6 +1,7 @@
 """Persistent coordination for Survivor's position-reducing orders."""
 from collections import defaultdict
 from contextlib import contextmanager
+from copy import deepcopy
 import fcntl
 import json
 import os
@@ -138,19 +139,34 @@ def persist(path, state):
 
 
 class FlattenResult(list):
-    def __init__(self, message, *, flat=False):
+    def __init__(self, message, *, flat=False, unknown=False):
         super().__init__([message])
         self.flat = flat
+        self.unknown = unknown
+
+
+class MutationBlocked(RuntimeError):
+    """A local policy refused a broker mutation before submission."""
 
 
 class ExitCoordinator:
-    def __init__(self, broker, path, notify, *, polls, interval, deadline):
+    def __init__(self, broker, path, notify, *, polls, interval, deadline, entry_allowed=None, budget=None):
         self.broker = broker
         self.path = path
         self.notify = notify
         self.polls = polls
         self.interval = interval
         self.deadline = deadline
+        self.entry_allowed = entry_allowed
+        self.budget = budget
+
+    def check_deadline(self):
+        if self.budget is not None and self.budget() <= 0:
+            raise MutationBlocked("Scheduled liquidation deadline expired")
+
+    def check_entry_allowed(self):
+        if self.entry_allowed is not None and not self.entry_allowed():
+            raise MutationBlocked("Entry window closed")
 
     def save(self, state):
         persist(self.path, state)
@@ -212,9 +228,14 @@ class ExitCoordinator:
         return json.dumps(key, separators=(",", ":"))
 
     def snapshot(self):
+        self.check_deadline()
         before = orders(self.broker)
+        self.check_deadline()
         exposure = positions(self.broker)
-        if orders(self.broker) != before:
+        self.check_deadline()
+        after = orders(self.broker)
+        self.check_deadline()
+        if after != before:
             raise ValueError("Order book changed during position read")
         return before, exposure
 
@@ -257,6 +278,7 @@ class ExitCoordinator:
             verified = {}
             attempts = defaultdict(int)
             deferred = set()
+            unknown_exposure = False
             try:
                 for _ in range(self.polls + max_retries):
                     verified = {}
@@ -316,17 +338,20 @@ class ExitCoordinator:
                         if replay_fenced:
                             return FlattenResult("Flatten INCOMPLETE: disputed trade remains fenced")
                         return FlattenResult("Broker confirmed flat with no outstanding orders", flat=True)
-                    time.sleep(self.interval)
+                    delay = self.interval if self.budget is None else min(self.interval, max(0, self.budget()))
+                    time.sleep(delay)
             except Exception as exc:
                 verified = {key: "UNKNOWN" for key in verified}
+                unknown_exposure = True
                 message = f"Exit verification interrupted ({type(exc).__name__})"
             if not cycle.get("unresolved"):
                 cycle["unresolved"] = True
                 self.save(state)
             self.escalate(state, message, verified)
-            return FlattenResult(f"Flatten INCOMPLETE: {message}")
+            return FlattenResult(f"Flatten INCOMPLETE: {message}", unknown=unknown_exposure)
 
     def detail(self, oid):
+        self.check_deadline()
         try:
             return order_detail(self.broker, oid)
         except Exception as exc:
@@ -528,6 +553,7 @@ class ExitCoordinator:
         return True
 
     def submit(self, state, cycle, key, net, qty, *, protection=None, entry=None, key_id=None):
+        previous = deepcopy(cycle) if self.budget is not None else None
         security, exchange, product = key
         side = entry["transaction_type"] if entry else ("SELL" if net > 0 else "BUY")
         tag = uuid4().hex[:24]
@@ -545,8 +571,10 @@ class ExitCoordinator:
         params = dict(security_id=security, exchange_segment=exchange, product_type=product,
                       transaction_type=side, quantity=qty, tag=tag)
         if entry is not None:
+            self.check_entry_allowed()
             reply = self.broker.place_order(**entry, tag=tag)
         elif protection is None:
+            self.check_deadline_after_intent(state, cycle, previous)
             try:
                 reply = self.broker._place_exit_order(**params, order_type=self.broker.MARKET, price=0)
             except Exception:
@@ -561,7 +589,17 @@ class ExitCoordinator:
             self.save(state)
         return pending["oid"]
 
+    def check_deadline_after_intent(self, state, cycle, previous):
+        try:
+            self.check_deadline()
+        except MutationBlocked:
+            cycle.clear()
+            cycle.update(previous)
+            self.save(state)
+            raise
+
     def cancel(self, state, cycle, oid, row, detail, exposure, *, key_id, prior=None):
+        previous = deepcopy(cycle) if self.budget is not None else None
         key = instrument(row)
         side = row["transactionType"]
         if side not in {"BUY", "SELL"}:
@@ -581,6 +619,7 @@ class ExitCoordinator:
         }
         cycle["pending_by_key"][key_id] = pending
         self.save(state)
+        self.check_deadline_after_intent(state, cycle, previous)
         try:
             reply = self.broker.cancel_order(oid)
         except Exception:
@@ -704,8 +743,13 @@ class ExitCoordinator:
             if any(exposure.values()) or any(row["orderStatus"] in WORKING for row in book.values()):
                 return None
             key = (str(params["security_id"]), params["exchange_segment"], params["product_type"])
+            previous = state.copy()
             cycle = self.start(state, flatten=False)
-            return self.submit(state, cycle, key, 0, params["quantity"], entry=params)
+            try:
+                return self.submit(state, cycle, key, 0, params["quantity"], entry=params)
+            except MutationBlocked:
+                self.save(previous)
+                return None
 
     def modify(self, oid, *, entry=False, **kwargs):
         with locked(self.path) as state:
@@ -729,4 +773,9 @@ class ExitCoordinator:
                 if quantity > abs(net):
                     return None
                 kwargs["quantity"] = quantity
+            if entry:
+                try:
+                    self.check_entry_allowed()
+                except MutationBlocked:
+                    return None
             return self.broker.modify_order(order_id=oid, **kwargs)
