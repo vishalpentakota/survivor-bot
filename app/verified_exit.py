@@ -257,7 +257,7 @@ class ExitCoordinator:
                     changed = False
                     for key in keys:
                         key_id = self.key_id(key)
-                        if key_id in deferred or key in reserved:
+                        if key in reserved or (key_id in deferred and key_id not in pending):
                             continue
                         try:
                             changed = self.advance(state, cycle, key, grouped[key], book, exposure,
@@ -318,44 +318,40 @@ class ExitCoordinator:
             if not row:
                 return False
             detail = self.detail(oid)
-            if (not same_execution(row, detail) or row["transactionType"] != pending["side"]
-                    or integer(row["quantity"]) != pending["quantity"]):
+            if not self.matches_pending(pending, row, detail):
                 return False
-            if pending.get("tag") and any(candidate.get("correlationId", pending["tag"]) != pending["tag"]
-                                          for candidate in (row, detail)):
+            filled = fill(row)
+            status = row["orderStatus"]
+            if (filled < pending.get("verified_fill", pending["filled"])
+                    or pending.get("verified_terminal", status) != status):
                 return False
-            cycle.setdefault("observed", {})[oid] = [list(key), fill(row)]
-            if row["orderStatus"] in TERMINAL:
+            evidence = {"oid": oid, "verified_fill": filled}
+            if "market" not in pending and self.is_market(pending):
+                evidence["market"] = True
+            for field in ("orderType", "correlationId"):
+                if field in row or field in detail:
+                    evidence[field] = row[field] if field in row else detail[field]
+            if status in TERMINAL:
+                evidence["verified_terminal"] = status
+            if any(pending.get(field) != value for field, value in evidence.items()):
+                pending.update(evidence)
+                self.save(state)
+            cycle.setdefault("observed", {})[oid] = [list(key), filled]
+            if status in TERMINAL:
                 return self.settle(state, cycle, book, exposure, key_id=key_id)
-            if pending.get("cancel_requested"):
-                if pending.get("cancel_rejected") and pending.get("cancel_attempts", 1) < 2:
-                    if fill(row) != pending["filled"] or net != pending["net"]:
-                        return False
-                    signed, _ = self.execution_net(state, cycle, key, rows)
-                    if signed != net or self.snapshot() != (book, exposure):
-                        return False
-                    self.cancel(state, cycle, oid, row, exposure, key_id=key_id, prior=pending)
-                    if cycle["pending_by_key"][key_id].get("cancel_rejected"):
-                        deferred.add(key_id)
-                    return True
-            elif pending.get("protection") or pending.get("entry"):
-                expected = pending["net"] + (fill(row) if pending["side"] == "BUY" else -fill(row))
-                if net == expected and self.snapshot() == (book, exposure):
-                    self.cancel(state, cycle, oid, row, exposure, key_id=key_id, prior=pending)
-                    if cycle["pending_by_key"][key_id].get("cancel_rejected"):
-                        deferred.add(key_id)
-                    return True
-            return False
+            return self.advance_cancellation(state, cycle, key_id, pending, row, rows,
+                                             book, exposure, deferred)
 
         signed, working = self.execution_net(state, cycle, key, rows)
         if working:
             oid, row = working[0]
+            detail = self.detail(oid)
             # Cancellation is safe for an identified order with no established
             # fill discrepancy. Reconcile its terminal execution before exiting.
             if (signed == net
-                    and same_execution(row, self.detail(oid))
+                    and same_execution(row, detail)
                     and self.snapshot() == (book, exposure)):
-                self.cancel(state, cycle, oid, row, exposure, key_id=key_id)
+                self.cancel(state, cycle, oid, row, detail, exposure, key_id=key_id)
                 if cycle["pending_by_key"][key_id].get("cancel_rejected"):
                     deferred.add(key_id)
                 return True
@@ -368,6 +364,59 @@ class ExitCoordinator:
             self.submit(state, cycle, key, net, abs(net), key_id=key_id)
             return True
         return False
+
+    def matches_pending(self, pending, row, detail):
+        if (not same_execution(row, detail) or instrument(row) != tuple(pending["key"])
+                or row["transactionType"] != pending["side"]
+                or integer(row["quantity"]) != pending["quantity"]):
+            return False
+        for field, expected in (("correlationId", pending.get("tag")),
+                                ("orderType", self.broker.MARKET if self.is_market(pending) else None)):
+            values = [candidate[field] for candidate in (row, detail) if field in candidate]
+            known = pending.get(field, expected)
+            if field in pending and not values:
+                return False
+            if values and any(value != (known if known is not None else values[0]) for value in values):
+                return False
+        return True
+
+    @staticmethod
+    def is_market(pending):
+        # Earlier submissions recorded a tag and the entry/protection flags.
+        return pending.get("market", bool(pending.get("tag")) and not (
+            pending.get("entry") or pending.get("protection") or pending.get("cancel_requested")))
+
+    def advance_cancellation(self, state, cycle, key_id, pending, row, rows, book, exposure, deferred):
+        key = tuple(pending["key"])
+        net = exposure.get(key, 0)
+        filled = fill(row)
+        remaining = pending["quantity"] - filled
+        delta = filled - pending["filled"]
+        expected = pending["net"] + (delta if pending["side"] == "BUY" else -delta)
+        if key_id in deferred or not remaining or net != expected:
+            return False
+        market = pending.get("market")
+        if market and (remaining != abs(net) or pending["side"] != ("SELL" if net > 0 else "BUY")):
+            return False
+        if pending.get("cancel_requested"):
+            if not pending.get("cancel_rejected") or pending.get("cancel_attempts", 1) >= 2:
+                return False
+        elif market:
+            if row["orderStatus"] != "PART_TRADED" or not filled or time.time() < cycle["deadline"]:
+                return False
+        elif not (pending.get("protection") or pending.get("entry")):
+            return False
+        if pending.get("cancel_requested") or market:
+            signed, _ = self.execution_net(state, cycle, key, rows)
+            if signed != net:
+                return False
+        if self.snapshot() != (book, exposure):
+            return False
+        oid = pending["oid"]
+        self.cancel(state, cycle, oid, row, self.detail(oid), exposure, key_id=key_id, prior=pending)
+        if cycle["pending_by_key"][key_id].get("cancel_rejected"):
+            deferred.add(key_id)
+        return True
 
     def execution_net(self, state, cycle, key, rows):
         # Dhan's order executions independently establish signed exposure. A
@@ -408,13 +457,17 @@ class ExitCoordinator:
         listed = book[oid]
         key = tuple(pending["key"])
         filled = fill(row)
-        if (not same_execution(row, listed) or instrument(row) != key
-                or row["transactionType"] != pending["side"]
-                or integer(row["quantity"]) != pending["quantity"]):
+        if (not self.matches_pending(pending, listed, row)
+                or filled < pending.get("verified_fill", pending["filled"])
+                or pending.get("verified_terminal", row["orderStatus"]) != row["orderStatus"]):
             return False
         cycle["observed"] = cycle.get("observed", {}) | {oid: [list(key), filled]}
         delta = filled - pending["filled"]
         expected = pending["net"] + (delta if pending["side"] == "BUY" else -delta)
+        if pending.get("market") and pending.get("cancel_requested"):
+            rows = {order_id: item for order_id, item in book.items() if instrument(item) == key}
+            if self.execution_net(state, cycle, key, rows)[0] != expected:
+                return False
         fresh_book, fresh_exposure = self.snapshot()
         if (delta < 0 or expected * pending["net"] < 0
                 or fresh_book != book or fresh_exposure != exposure
@@ -423,7 +476,7 @@ class ExitCoordinator:
         if filled and not pending.get("entry"):
             if pending.get("protection"):
                 source = "EXCHANGE_STOP"
-            elif not pending.get("cancel_requested"):
+            elif pending.get("market") or not pending.get("cancel_requested"):
                 source = "MARKET"
             else:
                 source = "UNKNOWN"
@@ -442,7 +495,8 @@ class ExitCoordinator:
         side = entry["transaction_type"] if entry else ("SELL" if net > 0 else "BUY")
         tag = uuid4().hex[:24]
         pending = dict(oid=None, tag=tag, key=list(key), net=net, side=side,
-                       quantity=qty, filled=0, protection=protection is not None, entry=entry is not None)
+                       quantity=qty, filled=0, protection=protection is not None, entry=entry is not None,
+                       market=protection is None and entry is None)
         cycle["exposure"] = {
             oid: pair for oid, pair in cycle["exposure"].items() if tuple(pair[0]) != key
         }
@@ -470,20 +524,24 @@ class ExitCoordinator:
             self.save(state)
         return pending["oid"]
 
-    def cancel(self, state, cycle, oid, row, exposure, *, key_id, prior=None):
+    def cancel(self, state, cycle, oid, row, detail, exposure, *, key_id, prior=None):
         key = instrument(row)
         side = row["transactionType"]
         if side not in {"BUY", "SELL"}:
             raise ValueError("Invalid cancellation side")
+        prior = prior or {}
+        pending = {**prior, "oid": oid, "key": list(key), "net": exposure.get(key, 0),
+                   "side": side, "quantity": integer(row["quantity"]), "filled": fill(row),
+                   "cancel_requested": True, "cancel_rejected": False,
+                   "cancel_attempts": prior.get("cancel_attempts", 0) + 1}
+        if not self.matches_pending(pending, row, detail):
+            raise ValueError("Cancellation identity changed")
+        for field in ("orderType", "correlationId"):
+            if field in row or field in detail:
+                pending[field] = row[field] if field in row else detail[field]
         cycle["exposure"] = {
             oid: pair for oid, pair in cycle["exposure"].items() if tuple(pair[0]) != key
         }
-        prior = prior or {}
-        pending = dict(oid=oid, key=list(key), net=exposure.get(key, 0),
-                       side=side, quantity=integer(row["quantity"]), filled=fill(row),
-                       cancel_requested=True, protection=prior.get("protection", False),
-                       entry=prior.get("entry", False),
-                       cancel_attempts=prior.get("cancel_attempts", 0) + 1)
         cycle["pending_by_key"][key_id] = pending
         self.save(state)
         try:
@@ -495,7 +553,7 @@ class ExitCoordinator:
         data = reply.get("data")
         explicit_reject = isinstance(data, dict) and data.get("orderStatus") == "REJECTED" and data.get("orderId") == oid
         remarks = reply.get("remarks")
-        if explicit_reject or (reply.get("status") == "failure" and isinstance(remarks, str)
+        if explicit_reject or (not isinstance(data, dict) and reply.get("status") == "failure" and isinstance(remarks, str)
                                and re.fullmatch(r"(?:.* )?explicit reject(?:ion)?[.!]?", remarks, re.IGNORECASE)):
             pending["cancel_rejected"] = True
             self.save(state)
