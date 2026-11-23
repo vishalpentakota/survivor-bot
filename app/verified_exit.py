@@ -96,7 +96,27 @@ def same_execution(first, second):
     )
 
 
-def execution_evidence(oid, row):
+def broker_charge(row):
+    """Use only an explicitly itemized, per-order broker total in INR."""
+    value = row.get("brokerageAndStatutoryCharges")
+    if type(value) not in (int, float, str):
+        return None
+    try:
+        amount = float(value)
+    except (ValueError, OverflowError):
+        return None
+    return amount if math.isfinite(amount) and amount >= 0 else None
+
+
+def execution_evidence(oid, row, detail=None):
+    evidence = _execution_evidence(oid, row)
+    charge = broker_charge(row)
+    if detail is not None and charge is not None and charge == broker_charge(detail):
+        evidence["broker_charge"] = charge
+    return evidence
+
+
+def _execution_evidence(oid, row):
     return {"id": oid, "status": row["orderStatus"], "quantity": fill(row),
             "price": float(row["averageTradedPrice"]), "side": row["transactionType"],
             "instrument": list(instrument(row)), "created": row.get("createTime")}
@@ -140,10 +160,11 @@ def persist(path, state):
 
 
 class FlattenResult(list):
-    def __init__(self, message, *, flat=False, unknown=False):
+    def __init__(self, message, *, flat=False, unknown=False, exit_ids=()):
         super().__init__([message])
         self.flat = flat
         self.unknown = unknown
+        self.exit_ids = exit_ids
 
 
 class MutationBlocked(RuntimeError):
@@ -251,7 +272,7 @@ class ExitCoordinator:
             fenced.add(instrument(self.detail(oid)))
         return fenced
 
-    def flatten(self, max_retries):
+    def flatten(self, max_retries, *, record_unattributed=None):
         with locked(self.path) as state:
             replay_fenced = "replay_check" in state
             cycle = state["cycle"]
@@ -334,11 +355,15 @@ class ExitCoordinator:
                             oid: fill(row) for key, rows in grouped.items() if key not in fenced
                             for oid, row in rows.items()
                         }
+                        exit_ids = tuple(cycle.get("exit_ids", ()))
+                        if exit_ids and record_unattributed is not None:
+                            record_unattributed(exit_ids)
                         state["cycle"] = None
                         self.save(state)
                         if replay_fenced:
                             return FlattenResult("Flatten INCOMPLETE: disputed trade remains fenced")
-                        return FlattenResult("Broker confirmed flat with no outstanding orders", flat=True)
+                        return FlattenResult("Broker confirmed flat with no outstanding orders", flat=True,
+                                             exit_ids=exit_ids)
                     delay = self.interval if self.budget is None else min(self.interval, max(0, self.budget()))
                     time.sleep(delay)
             except Exception as exc:
@@ -545,6 +570,8 @@ class ExitCoordinator:
             else:
                 source = "UNKNOWN"
             state["fills"][oid] = {"key": list(key), "source": source}
+            if cycle["flatten"] and oid not in cycle.setdefault("exit_ids", []):
+                cycle["exit_ids"].append(oid)
         if key_id is None:
             cycle["pending"] = None
         else:
@@ -745,7 +772,7 @@ class ExitCoordinator:
                 result["placed"] = oid
             return result
 
-    def closure(self, state, *, settle=True):
+    def closure(self, state, *, settle=True, retain_replay_fence=False):
         """Read a flat, quiet account and the verified exit IDs under the same lock."""
         executions = state.get("replay_executions", {})
         checking = bool(executions) and "replay_check" not in state
@@ -769,11 +796,13 @@ class ExitCoordinator:
                 raise ValueError("Unverified order status")
         for oid, evidence in executions.items():
             if oid in book:
-                listed = execution_evidence(oid, book[oid])
                 detail = self.detail(oid)
+                listed = execution_evidence(oid, book[oid])
                 if (not same_execution(book[oid], detail)
                         or listed != execution_evidence(oid, detail)):
                     return None
+                if "broker_charge" in evidence:
+                    listed = execution_evidence(oid, book[oid], detail)
                 if listed != evidence:
                     return self._contradicted_closure(state)
         if cycle:
@@ -803,7 +832,7 @@ class ExitCoordinator:
                 return self._contradicted_closure(state)
             if fresh_book != book:
                 return None
-        if checking:
+        if checking and not retain_replay_fence:
             del state["replay_check"]
             self.save(state)
         return book, state["fills"]
