@@ -28,6 +28,7 @@ import argparse
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
+from uuid import uuid4
 
 import urllib3.util.connection as urllib3_cn
 # Force IPv4 (`182.70.190.15` SECONDARY_MATCH on Dhan) because Windows temporary IPv6 privacy addresses rotate daily
@@ -40,7 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cloud_guard import LIVE_SWITCH, READ_ONLY, ReadOnlyBroker, RolePolicy, live_trading_enabled
 from dhan_broker import CachedTokenUnavailable, DhanTokenManager, load_env_file
 from verified_exit import (
-    ExitCoordinator, FlattenResult, TERMINAL, fill as order_fill, instrument,
+    ExitCoordinator, FlattenResult, TERMINAL, execution_evidence, fill as order_fill, instrument,
     integer as broker_integer, locked as exit_lock, order_detail, persist as persist_exit_data, positions as verified_positions, same_execution,
 )
 
@@ -218,7 +219,11 @@ def _recovery_pending(client, active=None) -> bool:
         with exit_lock(EXIT_LEDGER) as ledger:
             _exit_coordinator(client).deliver(ledger)
             cycle = ledger["cycle"]
-            return bool(cycle and (cycle["flatten"] or not active))
+            if cycle and (cycle["flatten"] or not active):
+                return True
+            identity = _trade_identity(active) if active else None
+            return identity is not None and any(
+                _trade_identity(row) == identity for row in _read_exit_journal())
     except Exception:
         return True
 
@@ -1589,7 +1594,56 @@ def _day_peak_net(journal: list) -> float:
     return peak
 
 
-def _verified_trade_fills(client, ledger, active, *, settle=True):
+def _trade_identity(trade):
+    fields = ("order_id", "security_id", "exchange_segment", "entry_time", "weapon", "direction")
+    if all(trade.get(field) not in (None, "") for field in fields):
+        return [str(trade[field]) for field in fields]
+    return None
+
+
+def _closure_amounts(proof):
+    """Recover the amounts from the broker executions persisted with the journal row."""
+    order_id, _, _, _, weapon, direction = proof["trade"]
+    entry = proof["entry"]
+    exits = proof["exits"]
+    executions = [entry, *exits]
+    ids = [item["id"] for item in executions]
+    side = "BUY" if weapon == "OPTIONS" or direction == "LONG" else "SELL"
+    opposite = "SELL" if side == "BUY" else "BUY"
+    if (entry["side"] != side or any(item["side"] != opposite for item in exits)
+            or any(item["instrument"] != proof["instrument"] for item in executions)
+            or entry["id"] != order_id or len(ids) != len(set(ids)) or not all(ids)
+            or any(item["status"] not in TERMINAL or item["status"] == "REJECTED"
+                   or broker_integer(item["quantity"]) <= 0 or not math.isfinite(item["price"])
+                   or item["price"] <= 0 for item in executions)):
+        raise ValueError("Invalid closure executions")
+    qty = entry["quantity"]
+    if sum(item["quantity"] for item in exits) != qty:
+        raise ValueError("Unbalanced closure executions")
+    exit_px = sum(item["quantity"] * item["price"] for item in exits) / qty
+    entry_px = entry["price"]
+    gross = (exit_px - entry_px) * qty
+    if weapon != "OPTIONS" and direction == "SHORT":
+        gross = -gross
+    return qty, entry_px, round(exit_px, 2), round(gross, 2), round(gross - ESTIMATED_ROUNDTRIP_CHARGES, 2)
+
+
+def _journal_proof(row):
+    proof = row.get("exit_proof")
+    try:
+        identity = _trade_identity(row)
+        if (identity is not None and proof["trade"] == identity
+                and proof["instrument"] == [identity[1], identity[2], "INTRADAY"]
+                and isinstance(proof["epoch"], str) and proof["epoch"]
+                and _closure_amounts(proof) == tuple(row[field] for field in
+                    ("quantity", "entry_price", "exit_price", "gross_pnl", "net_pnl"))):
+            return proof
+    except (KeyError, TypeError, ValueError, OverflowError):
+        pass
+    return None
+
+
+def _verified_trade_fills(client, ledger, active, *, settle=True, claimed=()):
     entry_id = str(active["order_id"])
     sec_id = str(active["security_id"])
     exchange = active["exchange_segment"]
@@ -1602,13 +1656,16 @@ def _verified_trade_fills(client, ledger, active, *, settle=True):
     book, exits = closure
     entry = book[entry_id]
     key = instrument(entry)
-    if key[:2] != (sec_id, exchange) or entry["transactionType"] != entry_side:
+    if key != (sec_id, exchange, "INTRADAY") or entry["transactionType"] != entry_side:
         return None
     qty = order_fill(entry)
-    if entry["orderStatus"] not in TERMINAL or not same_execution(entry, order_detail(client.dhan, entry_id)):
+    detail = order_detail(client.dhan, entry_id)
+    if (entry["orderStatus"] not in TERMINAL or not same_execution(entry, detail)
+            or entry.get("createTime") != detail.get("createTime")):
         return None
     if not qty:
-        return 0, 0, 0, None
+        fresh_book, exposure = coordinator.snapshot()
+        return (None, None) if fresh_book == book and not any(exposure.values()) else None
     entry_px = float(entry["averageTradedPrice"])
     entry_time = entry.get("createTime")
     later_entries = [
@@ -1618,7 +1675,7 @@ def _verified_trade_fills(client, ledger, active, *, settle=True):
         and instrument(row) == key and order_fill(row)
     ]
     next_entry = min(later_entries, default=None)
-    amounts = []
+    executions = []
     sources = set()
     for oid, row in book.items():
         if row.get("transactionType") != exit_side or row.get("orderStatus") not in TERMINAL:
@@ -1629,16 +1686,19 @@ def _verified_trade_fills(client, ledger, active, *, settle=True):
         # has been traded repeatedly. Legacy stops have an explicit order ID.
         exit_time = row.get("createTime")
         identified = oid == str(active.get("sl_order_id"))
-        if not identified and oid in exits and entry_time and exit_time:
-            identified = exit_time > entry_time and (next_entry is None or exit_time < next_entry)
-        if not identified:
+        if entry_time and exit_time:
+            in_trade = exit_time >= entry_time and (next_entry is None or exit_time < next_entry)
+            identified = in_trade and (identified or oid in exits and exit_time > entry_time)
+        if not identified or oid in claimed:
             continue
         filled = order_fill(row)
         if filled:
             price = float(row["averageTradedPrice"])
-            if not math.isfinite(price) or price <= 0 or not same_execution(row, order_detail(client.dhan, oid)):
+            detail = order_detail(client.dhan, oid)
+            if (not math.isfinite(price) or price <= 0 or not same_execution(row, detail)
+                    or row.get("createTime") != detail.get("createTime")):
                 return None
-            amounts.append((filled, price))
+            executions.append(execution_evidence(oid, row))
             recorded = exits.get(oid)
             source = recorded.get("source", "UNKNOWN") if isinstance(recorded, dict) else "UNKNOWN"
             if oid == str(active.get("sl_order_id")) or row.get("orderType") in {"STOP_LOSS", "STOP_LOSS_MARKET"}:
@@ -1646,59 +1706,102 @@ def _verified_trade_fills(client, ledger, active, *, settle=True):
             elif source == "UNKNOWN" and row.get("orderType") == "MARKET":
                 source = "MARKET"
             sources.add(source)
-    if (sum(filled for filled, _ in amounts) != qty or not math.isfinite(entry_px)
+    if (sum(item["quantity"] for item in executions) != qty or not math.isfinite(entry_px)
             or entry_px <= 0):
         return None
     final_book, exposure = coordinator.snapshot()
     if final_book != book or any(exposure.values()):
         return None
     execution_source = "UNKNOWN" if "UNKNOWN" in sources else sources.pop() if len(sources) == 1 else "MIXED"
-    return entry_px, sum(filled * price for filled, price in amounts) / qty, qty, execution_source
+    proof = {"trade": _trade_identity(active), "instrument": list(key),
+             "entry": execution_evidence(entry_id, entry), "exits": executions,
+             "epoch": ledger.get("replay_epoch")}
+    return proof, execution_source
 
 
-def _finalize_closed_trade(client: SurvivorDhanClient, state: Dict, active: Dict, reason: str,
+def _proof_executions(proof):
+    return {item["id"]: item for item in [proof["entry"], *proof["exits"]]}
+
+
+def _finalize_closed_trade(client: Optional[SurvivorDhanClient], state: Dict, active: Dict, reason: str,
                            *, replay_only: bool = False) -> bool:
     try:
         with exit_lock(EXIT_LEDGER) as ledger:
             journal = _read_exit_journal()
-            entry_id = str(active["order_id"])
-            closed = next((row for row in journal if str(row.get("order_id")) == entry_id
-                           and row.get("reconciled_with_broker")), None)
-            if closed is None:
+            identity = _trade_identity(active)
+            current = state.get("active_trade")
+            if identity is None or current and _trade_identity(current) != identity:
+                return False
+            applied = state.get("applied_exit_proofs", [])
+            if not current:
+                return identity in applied
+
+            matching = [index for index, row in enumerate(journal) if _trade_identity(row) == identity]
+            closed = journal[matching[0]] if len(matching) == 1 else None
+            proof = _journal_proof(closed) if closed else None
+            replayable = (proof and not ledger["cycle"] and proof["epoch"] == ledger.get("replay_epoch")
+                          and _proof_executions(proof) == ledger.get("replay_executions"))
+            if not replayable:
                 if replay_only:
                     return False
-                fills = _verified_trade_fills(client, ledger, active)
+                other_proofs = (_journal_proof(row) for row in journal if _trade_identity(row) != identity)
+                claimed = {item["id"] for other in other_proofs if other for item in other["exits"]}
+                fills = _verified_trade_fills(client, ledger, active, claimed=claimed)
                 if fills is None:
                     return False
-                entry_px, exit_px, qty, source = fills
-                if qty:
+                fresh, source = fills
+                if proof and (not fresh or _proof_executions(fresh) != _proof_executions(proof)):
+                    return False
+                if fresh:
+                    if not ledger.get("replay_epoch"):
+                        ledger["replay_epoch"] = uuid4().hex
+                    fresh["epoch"] = ledger["replay_epoch"]
+                    ledger["replay_executions"] = _proof_executions(fresh)
+                    persist_exit_data(EXIT_LEDGER, ledger)
+                if proof:
+                    closed = dict(closed, exit_proof=fresh)
+                    journal[matching[0]] = closed
+                    persist_exit_data(JOURNAL_FILE, journal)
+                elif fresh:
+                    proof = fresh
+                    qty, entry_px, exit_px, gross, net = _closure_amounts(proof)
                     closed = active.copy()
-                    gross_pnl = ((exit_px - entry_px) if active["weapon"] == "OPTIONS" or active["direction"] == "LONG"
-                                 else (entry_px - exit_px)) * qty
-                    now_ist = datetime.now(IST)
+                    now = datetime.now(IST).isoformat()
                     trigger = "POSITION_ABSENT" if reason == "EXCHANGE_SL_FILLED" else reason
                     exit_reason = "EXCHANGE_SL_FILLED" if source == "EXCHANGE_STOP" else trigger
-                    closed.update(quantity=qty, entry_price=entry_px, exit_price=round(exit_px, 2),
-                                  exit_time=now_ist.isoformat(), gross_pnl=round(gross_pnl, 2),
-                                  net_pnl=round(gross_pnl - ESTIMATED_ROUNDTRIP_CHARGES, 2),
+                    closed.update(quantity=qty, entry_price=entry_px, exit_price=exit_px,
+                                  exit_time=now, gross_pnl=gross, net_pnl=net,
                                   exit_reason=exit_reason, exit_trigger=trigger, execution_source=source,
-                                  reconciled_with_broker=True, trade_no=len(journal) + 1,
-                                  logged_at=now_ist.isoformat())
-                    journal.append(closed)
+                                  reconciled_with_broker=True, exit_proof=proof, logged_at=now)
+                    if matching:
+                        index = matching[0]
+                        closed["trade_no"] = journal[index].get("trade_no", index + 1)
+                        journal[index] = closed
+                        journal = [row for i, row in enumerate(journal) if i not in matching[1:]]
+                    else:
+                        closed["trade_no"] = len(journal) + 1
+                        journal.append(closed)
                     persist_exit_data(JOURNAL_FILE, journal)
+                elif matching:
+                    return False
+                else:
+                    closed = None
             updated = state.copy()
-            applied = updated.get("applied_exit_ids", [])
-            if closed and entry_id not in applied:
-                _apply_exit_risk(updated, closed, journal)
-                updated["applied_exit_ids"] = [*applied, entry_id]
+            apply_risk = closed is not None and identity not in applied
+            if apply_risk:
+                verified = [row for row in journal if _journal_proof(row)]
+                _apply_exit_risk(updated, closed, verified)
+                updated["applied_exit_proofs"] = [*applied, identity]
             updated["active_trade"] = None
             save_state(updated)
             state.update(updated)
-            if closed:
+            if apply_risk:
                 print(f"Trade closed ({closed['exit_reason']}) | {closed['symbol']} | "
                       f"Net: ₹{closed['net_pnl']:+,.2f}")
     except Exception:
         logger.exception("Trade closure persistence or verification failed")
+        if replay_only:
+            raise
         return False
     return True
 
@@ -1709,7 +1812,7 @@ def _apply_exit_risk(state, active, journal):
     today_str = now_ist.strftime("%Y-%m-%d")
     closed_day = active["exit_time"][:10]
     state["total_trades"] = state.get("total_trades", 0) + 1
-    state["realized_pnl_total"] = round(sum(float(row.get("net_pnl", 0)) for row in journal), 2)
+    state["realized_pnl_total"] = round(state.get("realized_pnl_total", 0) + net_pnl, 2)
     outcome = "wins" if net_pnl > 0 else "losses"
     state[outcome] = state.get(outcome, 0) + 1
     if closed_day != today_str:
@@ -1750,12 +1853,16 @@ def _apply_exit_risk(state, active, journal):
 
 def _flatten_trade(client, state, active, reason):
     if active:
-        if _finalize_closed_trade(client, state, active, reason, replay_only=True):
-            return 0
-        active["flatten_pending"] = True
-        active.setdefault("flatten_reason", reason)
-        state["active_trade"] = active
-        save_state(state)
+        try:
+            if _finalize_closed_trade(client, state, active, reason, replay_only=True):
+                return 0
+            active["flatten_pending"] = True
+            active.setdefault("flatten_reason", reason)
+            state["active_trade"] = active
+            save_state(state)
+        except Exception:
+            logger.exception("Exit recovery could not persist state")
+            return 1
     result = client.emergency_flatten_all()
     if result.flat and active and not _finalize_closed_trade(client, state, active, active["flatten_reason"]):
         result = FlattenResult("Broker flat; trade closure remains unresolved")
@@ -1961,12 +2068,18 @@ def _cmd_tick_inner(*, policy: RolePolicy = READ_ONLY, quiet_scan: bool = False)
             print("🪦 SURVIVOR BOT IS IN PERMANENT COMA (DEAD_COMA).")
         return
 
+    active = state.get("active_trade")
+    if live and active:
+        try:
+            if _finalize_closed_trade(None, state, active, "RESTART_EXIT_RECOVERY", replay_only=True):
+                return 0
+        except Exception:
+            return 1
     try:
         client = SurvivorDhanClient(policy=policy)
     except CachedTokenUnavailable as exc:
         print(f"🚨 TICK UNAVAILABLE — {exc}")
-        return
-    active = state.get("active_trade")
+        return 1 if live and active and active.get("flatten_pending") else None
     if live and (_recovery_pending(client, active) or active and active.get("flatten_pending")):
         return _flatten_trade(client, state, active, "RESTART_EXIT_RECOVERY")
     if state["status"] == "DEAD_COMA":
@@ -2383,20 +2496,18 @@ def cmd_reconcile(*, policy: Optional[RolePolicy] = None) -> None:
             net_liq, avail, utilized, open_pos = client.get_live_equity_and_positions()
             journal = _read_exit_journal()
             for trade in journal:
-                if not str(trade.get("entry_time", "")).startswith(today_str):
+                if _journal_proof(trade) or not str(trade.get("entry_time", "")).startswith(today_str):
                     continue
                 try:
                     fills = _verified_trade_fills(client, ledger, trade, settle=False)
                 except (TypeError, ValueError, KeyError):
                     continue
-                if not fills or not fills[2]:
+                if not fills or not fills[0]:
                     continue
-                entry, exit_price, qty, _ = fills
-                short = trade["weapon"] != "OPTIONS" and trade["direction"] == "SHORT"
-                gross = round((entry - exit_price if short else exit_price - entry) * qty, 2)
-                trade.update(entry_price=round(entry, 2), exit_price=round(exit_price, 2), quantity=qty,
-                             gross_pnl=gross, net_pnl=round(gross - ESTIMATED_ROUNDTRIP_CHARGES, 2),
-                             reconciled_with_broker=True)
+                proof, _ = fills
+                qty, entry, exit_price, gross, net = _closure_amounts(proof)
+                trade.update(entry_price=round(entry, 2), exit_price=exit_price, quantity=qty,
+                             gross_pnl=gross, net_pnl=net, reconciled_with_broker=True)
                 updated_count += 1
             if updated_count:
                 persist_exit_data(JOURNAL_FILE, journal)

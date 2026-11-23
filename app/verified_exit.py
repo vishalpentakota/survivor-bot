@@ -94,6 +94,12 @@ def same_execution(first, second):
     )
 
 
+def execution_evidence(oid, row):
+    return {"id": oid, "status": row["orderStatus"], "quantity": fill(row),
+            "price": float(row["averageTradedPrice"]), "side": row["transactionType"],
+            "instrument": list(instrument(row)), "created": row.get("createTime")}
+
+
 @contextmanager
 def locked(path):
     # Keep a stable inode for flock. Kernel releases the lock on process exit.
@@ -104,7 +110,7 @@ def locked(path):
                 state = json.load(storage)
         except FileNotFoundError:
             state = {"cycle": None, "alerts": {}, "fills": {}, "flat_book": None}
-        if (set(state) != {"cycle", "alerts", "fills", "flat_book"}
+        if (set(state) - {"replay_epoch", "replay_executions"} != {"cycle", "alerts", "fills", "flat_book"}
                 or not isinstance(state["alerts"], dict) or not isinstance(state["fills"], dict)
                 or state["cycle"] is not None and not isinstance(state["cycle"], dict)):
             raise ValueError("Invalid exit ledger")
@@ -164,6 +170,9 @@ class ExitCoordinator:
             "id": uuid4().hex, "deadline": time.time() + self.deadline,
             "pending": None, "flatten": flatten, "escalated": False, "confirmed": {}, "exposure": {},
         }
+        # Persist newer intent before any broker write, even if its acknowledgement is lost.
+        state["replay_epoch"] = state["cycle"]["id"]
+        state.pop("replay_executions", None)
         self.save(state)
         return state["cycle"]
 
@@ -595,7 +604,14 @@ class ExitCoordinator:
         if cycle and (cycle["flatten"] or not settle):
             return None
         book, exposure = self.snapshot()
-        if any(exposure.values()) or any(row["orderStatus"] in WORKING for row in book.values()):
+        executions = state.get("replay_executions", {})
+        if (any(exposure.values()) or any(row["orderStatus"] not in TERMINAL for row in book.values())
+                or any(oid in book and execution_evidence(oid, book[oid]) != evidence
+                       for oid, evidence in executions.items())):
+            if executions:
+                state["replay_epoch"] = uuid4().hex
+                del state["replay_executions"]
+                self.save(state)
             return None
         if cycle:
             if not cycle["pending"] or not self.settle(state, cycle, book, exposure):
