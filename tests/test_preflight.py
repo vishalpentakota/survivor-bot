@@ -22,6 +22,8 @@ class PreflightTests(unittest.TestCase):
             now=lambda tz=None: self.now.astimezone(tz) if tz else self.now.replace(tzinfo=None),
             fromisoformat=datetime.fromisoformat)))
         self.state = {"status": "ALIVE"}
+        self.real_load = self.engine.load_state
+        self.real_save = self.engine.save_state
         self.enterContext(patch.object(self.engine, "load_state", return_value=self.state))
         self.save = self.enterContext(patch.object(self.engine, "save_state"))
         self.sdk = self.sdk.dhanhq.return_value
@@ -210,6 +212,103 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(self.engine.monitor_active_trade_loop(
                 self.client, self.state, max_seconds=1, quiet_scan=True), 0)
             flatten.assert_called_once_with(self.client, self.state, self.state["active_trade"], "EOD_SQUARE_OFF")
+
+    def seed_quote_outage_monitor(self):
+        engine = self.engine
+        self.now = self.now.replace(hour=10)
+        for name, filename in (("STATE_FILE", "state.json"), ("_STATE_LOCK_FILE", "state.lock")):
+            self.enterContext(patch.object(engine, name, str(self.directory / filename)))
+        self.enterContext(patch.object(engine, "load_state", self.real_load))
+        self.enterContext(patch.object(engine, "save_state", self.real_save))
+        self.enterContext(patch.object(engine, "_recovery_pending", return_value=False))
+        self.stop = self.enterContext(patch.object(engine, "_inspect_active_stop", return_value="RESTING"))
+        self.flatten = self.enterContext(patch.object(engine, "_flatten_trade", return_value=0))
+        self.alert = self.enterContext(patch.object(engine, "send_telegram", return_value=False))
+        self.sdk.get_positions.return_value = self.ok([dict(
+            securityId="23", exchangeSegment="NSE_EQ", productType="INTRADAY", netQty=1)])
+        state = engine.load_state()
+        state.update(status="ALIVE", mortality_armed=True, active_trade=dict(
+            symbol="TEST", security_id="23", exchange_segment="NSE_EQ", instrument_type="EQUITY",
+            quantity=1, entry_price=100, direction="LONG", tick_size=.05, sl_order_id="2",
+            stop_loss=95, target_price=105, weapon="EQUITY_5X", peak_pts_gain=3,
+            entry_time=(self.now - timedelta(hours=1)).isoformat(),
+        ))
+        engine.save_state(state)
+        return state
+
+    def poll_quote_monitor(self, state):
+        elapsed = iter((0, 0, 2))
+        clock = SimpleNamespace(time=lambda: next(elapsed), sleep=Mock())
+        with patch.object(self.engine, "time", clock):
+            self.engine.monitor_active_trade_loop(self.client, state, max_seconds=1, quiet_scan=True)
+
+    def assert_quote_outage(self, state):
+        self.poll_quote_monitor(state)
+        persisted = self.engine.load_state(read_only=True)
+        self.assertEqual(persisted["active_trade"], state["active_trade"])
+        self.assertEqual(persisted["active_trade"]["stop_loss"], 95)
+        self.assertEqual(persisted["active_trade"]["peak_pts_gain"], 3)
+        self.assertEqual(persisted["quote_outage"]["security_id"], "23")
+        self.alert.assert_called_once()
+        self.assertIn("QUOTE_UNAVAILABLE", self.alert.call_args.args[0])
+        self.sdk.get_positions.assert_called_once()
+        self.stop.assert_called_once_with(self.client, state, state["active_trade"], .05)
+        self.flatten.assert_not_called()
+        self.sdk.modify_order.assert_not_called()
+        self.sdk.intraday_minute_data.assert_not_called()
+
+    def test_missing_quote_persists_incident_without_price_actions(self):
+        state = self.seed_quote_outage_monitor()
+        self.sdk.quote_data.return_value = self.ok({"data": {"NSE_EQ": {}}})
+        self.assert_quote_outage(state)
+
+    def test_stale_target_quote_persists_incident_without_price_actions(self):
+        state = self.seed_quote_outage_monitor()
+        self.quote(110, stamp=(self.now - timedelta(seconds=31)).isoformat())
+        self.assert_quote_outage(state)
+
+    def test_malformed_quote_persists_incident_without_price_actions(self):
+        state = self.seed_quote_outage_monitor()
+        self.quote(float("nan"))
+        self.assert_quote_outage(state)
+
+    def test_pending_quote_incident_survives_restart_until_validated_quote(self):
+        state = self.seed_quote_outage_monitor()
+        self.quote(98, stamp="")
+        self.poll_quote_monitor(state)
+        restarted = self.engine.load_state()
+        incident = restarted["quote_outage"]
+        self.now += timedelta(minutes=5)
+        self.quote(98, stamp=(self.now - timedelta(seconds=31)).isoformat())
+        self.poll_quote_monitor(restarted)
+        self.assertEqual(self.engine.load_state(read_only=True)["quote_outage"], incident)
+        self.flatten.assert_not_called()
+        self.quote(110)
+        self.poll_quote_monitor(self.engine.load_state())
+        self.assertNotIn("quote_outage", self.engine.load_state(read_only=True))
+        self.assertEqual(self.flatten.call_args.args[-1], "TARGET_HIT")
+
+    def test_pending_quote_incident_blocks_entry_after_position_closes(self):
+        state = self.seed_quote_outage_monitor()
+        self.quote(stamp="")
+        self.poll_quote_monitor(state)
+        # A separately verified exit can clear the active trade during the outage.
+        state = self.engine.load_state()
+        state["active_trade"] = None
+        self.engine.save_state(state)
+        self.sdk.get_positions.return_value = self.ok([])
+        with (patch.object(self.engine, "SurvivorDhanClient", return_value=self.client),
+              patch.object(self.engine, "_resume_entry", return_value="idle"),
+              patch.object(self.engine, "_entry_window_open", return_value=False) as scan_gate):
+            tick = lambda: self.engine._tick_with_state(
+                policy=self.engine.RolePolicy(trade=True), quiet_scan=True, owner_fd=None)
+            self.assertEqual(tick(), 1)
+            scan_gate.assert_not_called()
+            self.assertIn("quote_outage", self.engine.load_state(read_only=True))
+            self.quote()
+            tick()
+            scan_gate.assert_called_once()
+            self.assertNotIn("quote_outage", self.engine.load_state(read_only=True))
 
     def test_denied_repair_cannot_reset_state(self):
         self.sdk.get_order_list.side_effect = TimeoutError

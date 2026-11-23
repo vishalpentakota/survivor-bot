@@ -1562,6 +1562,9 @@ def trigger_permanent_coma(client: SurvivorDhanClient, state: Dict, net_equity: 
 
 def cmd_status(live_Orders: bool = False, *, policy: Optional[RolePolicy] = None) -> None:
     state = load_state(read_only=True)
+    if outage := state.get("quote_outage"):
+        print(f"QUOTE_UNAVAILABLE: {outage['exchange_segment']}:{outage['security_id']} "
+              f"pending since {outage['started_at']}")
     if state["status"] == "DEAD_COMA":
         print("🪦 SURVIVOR BOT IS IN PERMANENT COMA (DEAD_COMA).")
         print(f"Died at: {state.get('death_timestamp')} | Reason: {state.get('death_reason')}")
@@ -2180,6 +2183,18 @@ def _inspect_active_stop(client, state, active, tick, *, trigger=None):
         return "UNKNOWN"
 
 
+def _alert_quote_outage(outage):
+    send_telegram(f"QUOTE_UNAVAILABLE: {outage['exchange_segment']}:{outage['security_id']} "
+                  f"pending since {outage['started_at']}. New entries blocked pending a fresh broker quote.")
+
+
+def _clear_quote_outage(state):
+    updated = state.copy()
+    del updated["quote_outage"]
+    _save_state_update(state, updated)
+    del state["quote_outage"]
+
+
 def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: bool = True, max_seconds: int = 260, quiet_scan: bool = False) -> Optional[int]:
     """
     In-Trade 5-Second Live Monitor Loop:
@@ -2190,6 +2205,7 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
     - Fires immediate MARKET exit if Stop-Loss, Target, or 25m Theta Kill is hit.
     """
     start_ts = time.time()
+    outage_alerted = False
     while time.time() - start_ts < max_seconds:
         active = state.get("active_trade")
         if not active:
@@ -2248,9 +2264,22 @@ def monitor_active_trade_loop(client: SurvivorDhanClient, state: Dict, live: boo
 
         # Broker position/protection checks above still run during a quote outage.
         curr_ltp = _get_latest_tick_ltp(client, sec_id, exch, inst)
+        outage = state.get("quote_outage")
         if curr_ltp is None:
+            if outage is None:
+                outage = dict(security_id=sec_id, exchange_segment=exch, instrument_type=inst,
+                              started_at=datetime.now(IST).isoformat())
+                updated = state.copy()
+                updated["quote_outage"] = outage
+                _save_state_update(state, updated)
+            if not outage_alerted:
+                _alert_quote_outage(outage)
+                outage_alerted = True
             time.sleep(MONITOR_POLL_S)
             continue
+        if outage and (outage["security_id"], outage["exchange_segment"]) == (sec_id, exch):
+            _clear_quote_outage(state)
+            outage_alerted = False
 
         try:
             entry_dt = datetime.fromisoformat(active["entry_time"])
@@ -2530,6 +2559,12 @@ def _tick_with_state(*, policy: RolePolicy, quiet_scan: bool, owner_fd):
         return
 
     # 5. SCAN FOR NEW ENTRY (entry windows and max 4 trades/day)
+    if live and (outage := state.get("quote_outage")):
+        if _get_latest_tick_ltp(client, outage["security_id"], outage["exchange_segment"],
+                                outage["instrument_type"]) is None:
+            _alert_quote_outage(outage)
+            return 1
+        _clear_quote_outage(state)
     if state.get("daily_halted"):
         if not quiet_scan:
             print(f"⏸️ Daily halt active: {state.get('daily_halt_reason')}")
