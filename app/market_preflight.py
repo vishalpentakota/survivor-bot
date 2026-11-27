@@ -9,11 +9,15 @@ is the minimum calendar days to expiry (default 1, zero permits same-day).
 """
 from datetime import date, datetime, time, timedelta, timezone
 import json
+import logging
 import math
 from pathlib import Path
 
 from eod_ownership import IST
 from verified_exit import STATUSES, WORKING, fill, instrument, orders, response_data
+
+
+logger = logging.getLogger("survivor.market_preflight")
 
 
 MAX_BAR_AGE = timedelta(minutes=3)
@@ -35,7 +39,18 @@ def instant(value):
     if type(value) in (int, float):
         parsed = datetime.fromtimestamp(value, tz=timezone.utc)
     elif isinstance(value, str):
-        parsed = datetime.fromisoformat(value)
+        if not value.strip():
+            raise ValueError("Missing market timestamp (no trade data)")
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            try:
+                parsed = datetime.strptime(value, "%d/%m/%Y %H:%M:%S")
+            except ValueError as exc:
+                raise ValueError(f"Unrecognized market timestamp: {value!r}") from exc
+            if parsed.strftime("%d/%m/%Y %H:%M:%S") != value:
+                raise ValueError(f"Unrecognized market timestamp: {value!r}")
+            parsed = parsed.replace(tzinfo=IST)
     else:
         raise ValueError("Invalid market timestamp")
     if parsed.utcoffset() is None:
@@ -135,18 +150,61 @@ def checked_bars(response, now, expected=None):
 
 
 def latest_quote(broker, security_id, exchange_segment, calendar, clock):
-    payload = response_data(broker.quote_data(securities={exchange_segment: [int(security_id)]}))
-    if "status" in payload and payload["status"] != "success":
+    tag = f"{exchange_segment}:{security_id}"
+    try:
+        raw = broker.quote_data(securities={exchange_segment: [int(security_id)]})
+    except Exception as exc:
+        logger.warning("Quote failed for %s [cause=broker-unavailable]: %s: %s", tag, type(exc).__name__, exc)
+        raise
+    if not isinstance(raw, dict) or raw.get("status") != "success":
+        status = raw.get("status") if isinstance(raw, dict) else type(raw).__name__
+        remarks = raw.get("remarks") if isinstance(raw, dict) else None
+        cause = "rejected" if isinstance(raw, dict) and status not in (None, "") else "broker-unavailable"
+        logger.warning("Quote failed for %s [cause=%s]: status=%r remarks=%r", tag, cause, status, remarks)
+        raise ValueError(f"Quote {cause} (status={status!r}, remarks={remarks!r})")
+    payload = response_data(raw)
+    if not isinstance(payload, dict):
+        logger.warning("Quote failed for %s [cause=rejected]: non-dict payload %s", tag, type(payload).__name__)
         raise ValueError("Quote payload rejected")
-    quote = payload["data"][exchange_segment][str(security_id)]
-    if "status" in quote and quote["status"] != "success":
+    if "status" in payload and payload["status"] != "success":
+        logger.warning("Quote failed for %s [cause=rejected]: payload status=%r remarks=%r",
+                       tag, payload.get("status"), payload.get("remarks"))
+        raise ValueError("Quote payload rejected")
+    try:
+        quote = payload["data"][exchange_segment][str(security_id)]
+    except (KeyError, TypeError) as exc:
+        logger.warning("Quote failed for %s [cause=no-trade-data]: instrument absent from quote payload", tag)
+        raise ValueError("Quote has no trade data (instrument absent)") from exc
+    if not isinstance(quote, dict) or ("status" in quote and quote["status"] != "success"):
+        status = quote.get("status") if isinstance(quote, dict) else type(quote).__name__
+        logger.warning("Quote failed for %s [cause=rejected]: quote status=%r", tag, status)
         raise ValueError("Quote rejected")
+    raw_stamp = quote.get("last_trade_time")
+    if raw_stamp is None or (isinstance(raw_stamp, str) and not raw_stamp.strip()):
+        logger.warning("Quote failed for %s [cause=no-trade-data]: empty last_trade_time", tag)
+        raise ValueError("Quote has no trade data (empty last_trade_time)")
     now = clock()
     opening, _ = calendar.expected_bars(now)
-    stamp = instant(quote["last_trade_time"])
-    if stamp < opening or not timedelta() <= now - stamp <= MAX_QUOTE_AGE:
+    try:
+        stamp = instant(raw_stamp)
+    except ValueError as exc:
+        logger.warning("Quote failed for %s [cause=parse-failure]: last_trade_time=%r (%s)", tag, raw_stamp, exc)
+        raise
+    age = now - stamp
+    if stamp < opening or age > MAX_QUOTE_AGE:
+        logger.warning("Quote failed for %s [cause=stale-timestamp]: stamp=%s now=%s age=%.1fs",
+                       tag, stamp.isoformat(), now.isoformat(), age.total_seconds())
         raise ValueError("Stale or future quote timestamp")
-    return number(quote["last_price"])
+    if age < timedelta():
+        logger.warning("Quote failed for %s [cause=future-timestamp]: stamp=%s now=%s age=%.1fs",
+                       tag, stamp.isoformat(), now.isoformat(), age.total_seconds())
+        raise ValueError("Stale or future quote timestamp")
+    try:
+        return number(quote["last_price"])
+    except (KeyError, ValueError) as exc:
+        logger.warning("Quote failed for %s [cause=invalid-price]: last_price=%r (%s)",
+                       tag, quote.get("last_price"), exc)
+        raise
 
 
 def pending_orders(broker, positions):

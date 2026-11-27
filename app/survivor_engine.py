@@ -364,7 +364,11 @@ def _get_latest_tick_ltp(client: "SurvivorDhanClient", security_id: str,
     try:
         return latest_quote(client.dhan, security_id, exchange_segment, ExchangeCalendar(BASE_DIR),
                             lambda: datetime.now(IST))
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Quote unavailable for %s:%s (%s): %s: %s",
+            exchange_segment, security_id, instrument_type, type(exc).__name__, exc,
+        )
         return None
 
 
